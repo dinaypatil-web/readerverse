@@ -3,10 +3,11 @@ import { createRoot } from 'react-dom/client';
 import { 
   Play, Pause, SkipForward, SkipBack, Settings, X, Check, 
   List, Loader2, BookOpen, Trash2, Plus, Clock, Info, AlertCircle, 
-  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark
+  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
+import { GoogleGenAI, Modality } from "@google/genai";
 
 // Configure PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.mjs`;
@@ -36,44 +37,81 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V15_ULTRA';
+const DB_NAME = 'ReaderVerse_V20_STABLE';
 const STORE_NAME = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
-    request.onupgradeneeded = (ev: any) => {
-      const db = ev.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    try {
+      const request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = (ev: any) => {
+        const db = ev.target.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    } catch (e) {
+      reject(e);
+    }
   });
 };
 
 const saveBookToDB = async (book: Book) => {
-  const db = await initDB();
-  const transaction = db.transaction(STORE_NAME, 'readwrite');
-  transaction.objectStore(STORE_NAME).put(book);
+  try {
+    const db = await initDB();
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    transaction.objectStore(STORE_NAME).put(book);
+  } catch (err) {
+    console.error("Storage Error:", err);
+  }
 };
 
 const getBooks = async (): Promise<Book[]> => {
-  const db = await initDB();
-  return new Promise((resolve) => {
-    const transaction = db.transaction(STORE_NAME, 'readonly');
-    const request = transaction.objectStore(STORE_NAME).getAll();
-    request.onsuccess = () => resolve(request.result);
-  });
+  try {
+    const db = await initDB();
+    return new Promise((resolve) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const request = transaction.objectStore(STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve([]);
+    });
+  } catch (e) {
+    return [];
+  }
 };
 
 const removeBookFromDB = async (id: string) => {
-  const db = await initDB();
-  db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME).delete(id);
+  try {
+    const db = await initDB();
+    db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME).delete(id);
+  } catch (e) {
+    console.error("Delete Error:", e);
+  }
 };
 
-// --- Specialized Components ---
+// --- Audio Decoding Utilities ---
+function decodeBase64(base64: string) {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const buffer = ctx.createBuffer(1, dataInt16.length, 24000);
+  const channelData = buffer.getChannelData(0);
+  for (let i = 0; i < dataInt16.length; i++) {
+    channelData[i] = dataInt16[i] / 32768.0;
+  }
+  return buffer;
+}
+
+// --- UI Components ---
 
 const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, activeWordRef }: { 
   block: TextBlock, 
@@ -83,7 +121,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
   activeWordRef: React.RefObject<HTMLSpanElement | null>
 }) => {
   return (
-    <p className="font-serif leading-relaxed text-left transition-all duration-300" style={{ fontSize: `${fontSize}px` }}>
+    <p className="font-serif leading-relaxed text-left will-change-contents mb-6" style={{ fontSize: `${fontSize}px` }}>
       {block.words.map((word, wIdx) => {
         const globalIdx = block.wordStartIndex + wIdx;
         const isCurrent = currentWordIndex === globalIdx;
@@ -92,7 +130,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
             key={wIdx} 
             ref={isCurrent ? activeWordRef : null}
             onClick={() => onWordClick(globalIdx)}
-            className={`inline-block mr-[0.25em] px-1 py-0.5 rounded-lg transition-all duration-150 cursor-pointer select-none ${isCurrent ? 'bg-blue-600 text-white shadow-lg scale-110 font-bold z-10' : 'opacity-70'}`}
+            className={`inline-block mr-[0.2em] px-1 rounded-md transition-all duration-75 cursor-pointer select-none touch-manipulation ${isCurrent ? 'bg-blue-600 text-white font-bold shadow-md' : 'opacity-60 hover:opacity-100'}`}
           >
             {word}
           </span>
@@ -101,21 +139,20 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
     </p>
   );
 }, (prev, next) => {
-  const prevWasActive = prev.currentWordIndex >= prev.block.wordStartIndex && prev.currentWordIndex < prev.block.wordStartIndex + prev.block.wordCount;
-  const nextIsActive = next.currentWordIndex >= next.block.wordStartIndex && next.currentWordIndex < next.block.wordStartIndex + next.block.wordCount;
-  if (!prevWasActive && !nextIsActive) return true;
+  const prevIsVisible = prev.currentWordIndex >= prev.block.wordStartIndex && prev.currentWordIndex < prev.block.wordStartIndex + prev.block.wordCount;
+  const nextIsVisible = next.currentWordIndex >= next.block.wordStartIndex && next.currentWordIndex < next.block.wordStartIndex + next.block.wordCount;
+  if (!prevIsVisible && !nextIsVisible) return true;
   return prev.currentWordIndex === next.currentWordIndex && prev.fontSize === next.fontSize;
 });
 
 const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDocumentProxy, pageNum: number, scale: number, onVisible: (n: number) => void }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const textLayerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const observer = new IntersectionObserver(([entry]) => {
       if (entry.isIntersecting) onVisible(pageNum);
-    }, { threshold: 0.3 });
+    }, { threshold: 0.1 });
     if (containerRef.current) observer.observe(containerRef.current);
     return () => observer.disconnect();
   }, [pageNum, onVisible]);
@@ -124,51 +161,37 @@ const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDoc
     let renderTask: any;
     const render = async () => {
       if (!canvasRef.current) return;
-      const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale });
-      const canvas = canvasRef.current;
-      const context = canvas.getContext('2d');
-      if (!context) return;
-
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
-
-      renderTask = page.render({ canvasContext: context, viewport });
-      await renderTask.promise;
-
-      if (textLayerRef.current) {
-        textLayerRef.current.innerHTML = '';
-        textLayerRef.current.style.width = `${viewport.width}px`;
-        textLayerRef.current.style.height = `${viewport.height}px`;
-        const textContent = await page.getTextContent();
-        pdfjsLib.renderTextLayer({
-          textContentSource: textContent,
-          container: textLayerRef.current,
-          viewport: viewport,
-        });
-      }
+      try {
+        const page = await pdf.getPage(pageNum);
+        const viewport = page.getViewport({ scale });
+        const canvas = canvasRef.current;
+        const context = canvas.getContext('2d', { alpha: false });
+        if (!context) return;
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        renderTask = page.render({ canvasContext: context, viewport });
+        await renderTask.promise;
+        page.cleanup();
+      } catch (e) {}
     };
     render();
-    return () => renderTask?.cancel();
+    return () => { if (renderTask) renderTask.cancel(); };
   }, [pdf, pageNum, scale]);
 
   return (
-    <div ref={containerRef} className="relative mb-8 shadow-2xl mx-auto flex flex-col items-center bg-white dark:bg-zinc-800 rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-700 transition-transform duration-300">
-      <div className="relative" style={{ width: 'fit-content' }}>
-        <canvas ref={canvasRef} />
-        <div ref={textLayerRef} className="absolute inset-0 pointer-events-auto text-transparent selection:bg-blue-600/30" />
-      </div>
-      <div className="py-3 text-[10px] font-black opacity-30 uppercase tracking-[0.2em]">P.{pageNum}</div>
+    <div ref={containerRef} className="relative mb-6 shadow-lg mx-auto bg-white dark:bg-zinc-800 rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-700">
+      <canvas ref={canvasRef} className="block mx-auto max-w-full h-auto" />
+      <div className="py-2 text-[8px] font-bold opacity-30 text-center bg-zinc-50 dark:bg-zinc-900/50 uppercase tracking-widest">P.{pageNum}</div>
     </div>
   );
 });
 
-// --- Utility & Parsers ---
+// --- Parsing Logic ---
 
 function walkNodes(node: Node, results: string[]) {
   if (node.nodeType === Node.TEXT_NODE) {
     const val = node.textContent?.trim();
-    if (val && val.length > 0) results.push(String(val));
+    if (val) results.push(val);
   } else if (node.nodeType === Node.ELEMENT_NODE) {
     const tag = (node as Element).tagName.toUpperCase();
     if (['SCRIPT', 'STYLE', 'HEAD', 'META', 'LINK', 'SVG', 'NOSCRIPT'].includes(tag)) return;
@@ -179,11 +202,11 @@ function walkNodes(node: Node, results: string[]) {
 
 async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
   const book = e(buffer);
-  onStatus("Unpacking Manuscript...");
+  onStatus("Inhaling...");
   await book.opened;
   const metadata = await (book as any).loaded.metadata;
   const navigation = await (book as any).loaded.navigation;
-  const toc = navigation ? (navigation.toc || []) : [];
+  const toc = navigation?.toc || [];
   const chapters: ChapterEntry[] = [];
   const displayBlocks: TextBlock[] = [];
   let totalWordCount = 0;
@@ -196,69 +219,58 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
     const item = spineItems[i];
     try {
       const url = item.url || item.href;
-      let rawHtml: string | null = await book.archive.getText(url);
+      const rawHtml = await book.archive.getText(url);
       if (!rawHtml) continue;
-      
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(rawHtml, "text/html");
-      const foundTextParts: string[] = [];
-      walkNodes(doc.body || doc.documentElement, foundTextParts);
+      const doc = new DOMParser().parseFromString(rawHtml, "text/html");
+      const parts: string[] = [];
+      walkNodes(doc.body || doc.documentElement, parts);
       
       const itemHref = item.href?.split('#')[0].replace(/^\.\//, '');
-      const matchingToc = toc.find((t: any) => {
-        const tocHref = t.href?.split('#')[0].replace(/^\.\//, '');
-        return itemHref === tocHref || itemHref.endsWith(tocHref) || tocHref.endsWith(itemHref);
+      const match = toc.find((t: any) => {
+        const tHref = t.href?.split('#')[0].replace(/^\.\//, '');
+        return itemHref === tHref || itemHref.endsWith(tHref) || tHref.endsWith(itemHref);
       });
+      if (match) chapters.push({ title: match.label?.trim() || `Chapter ${chapters.length + 1}`, startIndex: totalWordCount });
 
-      if (matchingToc) {
-        chapters.push({ title: matchingToc.label?.trim() || `Chapter ${chapters.length + 1}`, startIndex: totalWordCount });
-      }
-      
-      const chapterText = foundTextParts.join(" ").replace(/\s+/g, ' ').trim();
-      if (chapterText.length > 0) {
-        const paragraphs = chapterText.split(/\n+/).map(p => p.trim()).filter(p => p.length > 0);
-        paragraphs.forEach(pText => {
-          const words = pText.split(/\s+/).filter(w => w.length > 0);
+      const text = parts.join(" ").replace(/\s+/g, ' ').trim();
+      if (text) {
+        text.split(/\n+/).forEach(p => {
+          const words = p.trim().split(/\s+/).filter(w => w.length > 0);
           if (words.length > 0) {
             displayBlocks.push({ words, wordStartIndex: totalWordCount, wordCount: words.length });
             totalWordCount += words.length;
           }
         });
       }
-    } catch (err) { console.warn(`Extraction error:`, err); }
-    if (i % 5 === 0) { onStatus(`Indexing ${i}/${spineItems.length}...`); await new Promise(r => setTimeout(r, 0)); }
+    } catch (e) {}
+    if (i % 5 === 0) { onStatus(`Parsing ${i+1}/${spineItems.length}...`); await new Promise(r => setTimeout(r, 0)); }
   }
   return { displayBlocks, chapters, metadata };
 }
 
 async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
-  onStatus("Indexing PDF...");
+  onStatus("Rendering PDF Layout...");
   const pdf = await pdfjsLib.getDocument({ data: buffer, useSystemFonts: true }).promise;
   const displayBlocks: TextBlock[] = [];
   const chapters: ChapterEntry[] = [];
-  let totalWordCount = 0;
-
+  let totalWords = 0;
   for (let i = 1; i <= pdf.numPages; i++) {
-    onStatus(`Page ${i}/${pdf.numPages}`);
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items.map((it: any) => it.str).join(" ").replace(/\s+/g, ' ').trim();
-    if (pageText) {
-      const words = pageText.split(/\s+/).filter(w => w.length > 0);
-      if (words.length > 0) {
-        displayBlocks.push({ words, wordStartIndex: totalWordCount, wordCount: words.length });
-        if (i === 1 || i % 10 === 0) {
-          chapters.push({ title: `Page ${i}`, startIndex: totalWordCount, pageNumber: i });
-        }
-        totalWordCount += words.length;
-      }
+    const text = content.items.map((it: any) => it.str).join(" ").replace(/\s+/g, ' ').trim();
+    if (text) {
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      displayBlocks.push({ words, wordStartIndex: totalWords, wordCount: words.length });
+      if (i === 1 || i % 10 === 0) chapters.push({ title: `Page ${i}`, startIndex: totalWords, pageNumber: i });
+      totalWords += words.length;
     }
     page.cleanup();
+    if (i % 10 === 0) { onStatus(`Indexing Page ${i}/${pdf.numPages}...`); await new Promise(r => setTimeout(r, 0)); }
   }
   return { displayBlocks, chapters, metadata: await pdf.getMetadata() };
 }
 
-// --- Main Application ---
+// --- App Component ---
 
 const App = () => {
   const [books, setBooks] = useState<Book[]>([]);
@@ -270,7 +282,6 @@ const App = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [fontSize, setFontSize] = useState(20);
@@ -280,257 +291,297 @@ const App = () => {
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>("");
+  const [useNeuralTTS, setUseNeuralTTS] = useState(false);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeWordRef = useRef<HTMLSpanElement | null>(null);
   const pdfInstanceRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const isPlayingRef = useRef(false);
-  const currentWordIndexRef = useRef(0);
+  const wordIdxRef = useRef(0);
+  const scrollRequestRef = useRef<number | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const syncIntervalRef = useRef<number | null>(null);
+  const boundaryFiredRef = useRef(false);
 
-  // Cross-browser voice loading with intensive mobile support
+  // Initialize Voices
   useEffect(() => {
     const loadVoices = () => {
       const voices = window.speechSynthesis.getVoices();
-      // Prioritize high-quality neural voices
-      const sorted = voices
-        .filter(v => v.lang.startsWith('en'))
-        .sort((a, b) => {
-          const keywords = ['Microsoft', 'Edge', 'Google', 'Natural', 'Premium'];
-          const aPrio = keywords.findIndex(k => a.name.includes(k));
-          const bPrio = keywords.findIndex(k => b.name.includes(k));
-          return (aPrio === -1 ? 99 : aPrio) - (bPrio === -1 ? 99 : bPrio);
-        });
-
+      if (!voices.length) return;
+      const sorted = voices.filter(v => v.lang.startsWith('en')).sort((a,b) => (a.name.includes('Natural') || a.name.includes('Premium') || a.name.includes('Google')) ? -1 : 1);
       setAvailableVoices(sorted);
-      if (sorted.length > 0 && !selectedVoiceURI) {
-        setSelectedVoiceURI(sorted[0].voiceURI);
+      if (sorted.length && !selectedVoiceURI) {
+        const best = sorted.find(v => v.name.includes('Natural') || v.name.includes('Google')) || sorted[0];
+        setSelectedVoiceURI(best.voiceURI);
       }
     };
-    
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
-    const interval = setInterval(() => {
-      if (window.speechSynthesis.getVoices().length > 0) {
-        loadVoices();
-        clearInterval(interval);
-      }
-    }, 800);
-
-    return () => {
-      window.speechSynthesis.onvoiceschanged = null;
-      clearInterval(interval);
-    };
+    const interval = setInterval(loadVoices, 3000);
+    return () => { window.speechSynthesis.onvoiceschanged = null; clearInterval(interval); };
   }, [selectedVoiceURI]);
 
+  // Load Persistence
   useEffect(() => {
     getBooks().then(stored => {
       setBooks(stored);
-      if (stored.length === 0) {
-        setBooks([{
-          id: 'demo', title: 'ReaderVerse Ultra Sync', author: 'Team ReaderVerse',
-          displayBlocks: [{ words: "Welcome. This pro edition features precision auto-scroll and seamless continuous reading. Tap a word or hit play to begin.".split(" "), wordStartIndex: 0, wordCount: 20 }],
-          chapters: [{ title: 'Intro', startIndex: 0 }], lastPosition: 0, type: 'demo'
+      if (!stored.length) {
+        setBooks([{ 
+          id: 'demo', 
+          title: 'ReaderVerse Pro', 
+          author: 'ElevenReaders Studio', 
+          displayBlocks: [{ words: "Neural-grade synchronicity enabled. Tap any word to jump. This reader handles heavy EPUBs and PDFs with mobile-optimized memory usage. Hit play to listen to the future.".split(" "), wordStartIndex: 0, wordCount: 29 }], 
+          chapters: [{ title: 'Overview', startIndex: 0 }], 
+          lastPosition: 0, 
+          type: 'demo' 
         }]);
       }
     });
   }, []);
 
+  // PDF Pre-load
   useEffect(() => {
     if (activeBook?.type === 'pdf' && activeBook.fileData) {
-      pdfjsLib.getDocument({ data: activeBook.fileData }).promise.then(p => {
-        pdfInstanceRef.current = p;
-      });
-      setReaderMode('pdf');
-    } else {
-      setReaderMode('reflow');
+      pdfjsLib.getDocument({ data: activeBook.fileData }).promise.then(p => pdfInstanceRef.current = p);
     }
   }, [activeBook]);
 
-  // Precision Auto-Scroll: word being read shall appear 3 lines above the audio control
+  // Precision Mobile Auto-Scroll
   useEffect(() => {
     if (view === 'reader' && readerMode === 'reflow' && activeWordRef.current && scrollContainerRef.current) {
-      const container = scrollContainerRef.current;
-      const word = activeWordRef.current;
-      const containerRect = container.getBoundingClientRect();
-      const wordRect = word.getBoundingClientRect();
-      
-      // Control bar is approx 240px from bottom on mobile. 
-      // 3 lines of text is approx 90px.
-      // Word center should be approx 330px above container bottom.
-      const targetFromBottom = 330; 
-      const targetY = containerRect.bottom - targetFromBottom;
-      const currentY = wordRect.top + (wordRect.height / 2);
-      
-      if (Math.abs(currentY - targetY) > 30) {
-        const scrollDiff = currentY - targetY;
-        container.scrollTo({
-          top: container.scrollTop + scrollDiff,
-          behavior: 'smooth'
-        });
-      }
+      if (scrollRequestRef.current) cancelAnimationFrame(scrollRequestRef.current);
+      scrollRequestRef.current = requestAnimationFrame(() => {
+        const container = scrollContainerRef.current;
+        const word = activeWordRef.current;
+        if (!container || !word) return;
+        const cRect = container.getBoundingClientRect();
+        const wRect = word.getBoundingClientRect();
+        const targetPos = cRect.bottom - 280; 
+        const currentPos = wRect.top + wRect.height / 2;
+        if (Math.abs(currentPos - targetPos) > 45) {
+          container.scrollTo({ top: container.scrollTop + (currentPos - targetPos), behavior: isPlayingRef.current ? 'smooth' : 'auto' });
+        }
+      });
     }
   }, [currentWordIndex, view, readerMode]);
 
   const totalWords = useMemo(() => {
     if (!activeBook) return 0;
-    const lastBlock = activeBook.displayBlocks[activeBook.displayBlocks.length - 1];
-    return lastBlock ? lastBlock.wordStartIndex + lastBlock.wordCount : 0;
+    const last = activeBook.displayBlocks[activeBook.displayBlocks.length - 1];
+    return last ? last.wordStartIndex + last.wordCount : 0;
   }, [activeBook]);
 
   const currentChapter = useMemo(() => {
     if (!activeBook) return null;
-    let activeChapter = activeBook.chapters[0];
-    for (const ch of activeBook.chapters) {
-      if (currentWordIndex >= ch.startIndex) {
-        activeChapter = ch;
-      } else {
-        break;
-      }
+    let ch = activeBook.chapters[0];
+    for (const c of activeBook.chapters) {
+      if (currentWordIndex >= c.startIndex) ch = c;
+      else break;
     }
-    return activeChapter;
+    return ch;
   }, [activeBook, currentWordIndex]);
 
-  const findBlockForWord = useCallback((wordIdx: number) => {
+  const findBlockIdx = useCallback((wIdx: number) => {
     if (!activeBook) return 0;
     let low = 0, high = activeBook.displayBlocks.length - 1;
     while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
+      const mid = (low + high) >>> 1;
       const b = activeBook.displayBlocks[mid];
-      if (wordIdx >= b.wordStartIndex && wordIdx < b.wordStartIndex + b.wordCount) return mid;
-      if (wordIdx < b.wordStartIndex) high = mid - 1;
-      else low = mid + 1;
+      if (wIdx >= b.wordStartIndex && wIdx < b.wordStartIndex + b.wordCount) return mid;
+      if (wIdx < b.wordStartIndex) high = mid - 1; else low = mid + 1;
     }
     return 0;
   }, [activeBook]);
 
   const saveProgress = useCallback((idx: number) => {
-    if (!activeBook) return;
-    activeBook.lastPosition = idx;
-    saveBookToDB(activeBook);
-    setBooks(prev => prev.map(b => b.id === activeBook.id ? { ...b, lastPosition: idx } : b));
+    if (activeBook) { activeBook.lastPosition = idx; saveBookToDB(activeBook); }
   }, [activeBook]);
 
-  // Stable speak function that pulls latest ref values
-  const speakCurrentBlock = useCallback(() => {
+  // --- Hybrid Mobile Sync TTS Engine ---
+
+  const speakNeural = useCallback(async (text: string, onEnd: () => void) => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      const res = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text }] }],
+        config: { 
+          responseModalities: [Modality.AUDIO], 
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } } 
+        },
+      });
+      const b64 = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!b64) throw new Error("Audio generation failed");
+      
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const ctx = audioCtxRef.current;
+      const buffer = await decodeAudioData(decodeBase64(b64), ctx);
+      
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.playbackRate.value = playbackSpeed;
+      src.connect(ctx.destination);
+      audioSourceRef.current = src;
+      
+      const words = text.split(/\s+/).filter(w => w.length > 0);
+      const wordDuration = (buffer.duration / playbackSpeed) / words.length;
+      let lastHeard = 0;
+      const startTime = Date.now();
+      
+      syncIntervalRef.current = window.setInterval(() => {
+        const curW = Math.floor(((Date.now() - startTime) / 1000) / wordDuration);
+        if (curW > lastHeard && curW < words.length) { 
+          lastHeard = curW; 
+          setCurrentWordIndex(wordIdxRef.current + curW); 
+        }
+      }, 40);
+
+      src.onended = () => { 
+        if (syncIntervalRef.current) clearInterval(syncIntervalRef.current); 
+        onEnd(); 
+      };
+      src.start();
+    } catch (e) {
+      console.error("Neural TTS failed:", e);
+      setUseNeuralTTS(false); 
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+    }
+  }, [playbackSpeed]);
+
+  const speak = useCallback(() => {
     if (!activeBook || !isPlayingRef.current) return;
-    window.speechSynthesis.cancel();
     
-    const indexAtStart = currentWordIndexRef.current;
-    const blockIdx = findBlockForWord(indexAtStart);
-    const block = activeBook.displayBlocks[blockIdx];
+    window.speechSynthesis.cancel();
+    if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} audioSourceRef.current = null; }
+    if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+
+    const sIdx = wordIdxRef.current;
+    const bIdx = findBlockIdx(sIdx);
+    const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
+    
+    const relOffset = sIdx - block.wordStartIndex;
+    const textSegment = block.words.slice(relOffset).join(" ");
 
-    const relativeWordIdx = indexAtStart - block.wordStartIndex;
-    const wordsSlice = block.words.slice(relativeWordIdx);
-    const textToSpeak = wordsSlice.join(" ");
-
-    const utterance = new SpeechSynthesisUtterance(textToSpeak);
-    const voice = availableVoices.find(v => v.voiceURI === selectedVoiceURI);
-    if (voice) utterance.voice = voice;
-    utterance.rate = playbackSpeed;
-
-    // Normalizing boundary events for all engines
-    utterance.onboundary = (event) => {
-      if (event.name === 'word') {
-        const charIdx = event.charIndex;
-        // Robust word mapping logic for non-Microsoft engines
-        const textBefore = textToSpeak.substring(0, charIdx).trim();
-        const wordsBeforeCount = textBefore.length > 0 ? textBefore.split(/\s+/).length : 0;
-        const newGlobalIndex = block.wordStartIndex + relativeWordIdx + wordsBeforeCount;
-        
-        if (newGlobalIndex > currentWordIndexRef.current) {
-          currentWordIndexRef.current = newGlobalIndex;
-          setCurrentWordIndex(newGlobalIndex);
-          if (newGlobalIndex % 15 === 0) saveProgress(newGlobalIndex);
-        }
+    const onSegmentFinish = () => {
+      const nextWord = block.wordStartIndex + block.wordCount;
+      if (nextWord < totalWords) {
+        wordIdxRef.current = nextWord;
+        setCurrentWordIndex(nextWord);
+        saveProgress(nextWord);
+        setTimeout(() => { if (isPlayingRef.current) speak(); }, 80);
+      } else {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
       }
     };
 
-    utterance.onend = () => {
-      if (isPlayingRef.current) {
-        const nextWordIndex = block.wordStartIndex + block.wordCount;
-        if (nextWordIndex < totalWords) {
-          currentWordIndexRef.current = nextWordIndex;
-          setCurrentWordIndex(nextWordIndex);
-          saveProgress(nextWordIndex);
-          
-          // Continuous Reading & Chapter Bookmarking
-          const nextCh = activeBook.chapters.find(c => c.startIndex === nextWordIndex);
-          if (nextCh) {
-            console.log(`Bookmarking next chapter: ${nextCh.title}`);
+    if (useNeuralTTS && process.env.API_KEY) {
+      speakNeural(textSegment, onSegmentFinish);
+      return;
+    }
+
+    const utt = new SpeechSynthesisUtterance(textSegment);
+    const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI);
+    if (v) utt.voice = v;
+    utt.rate = playbackSpeed;
+    
+    // Hybrid Sync Logic: Use high-frequency estimation with 'onboundary' correction
+    const wordsInSegment = textSegment.split(/\s+/).filter(w => w.length > 0);
+    const estimatedWPS = (160 / 60) * playbackSpeed; // Estimated words per second
+    const startTime = Date.now();
+    let estimatedWordCount = 0;
+    boundaryFiredRef.current = false;
+
+    syncIntervalRef.current = window.setInterval(() => {
+      // Only estimate if onboundary hasn't fired recently to prevent jumpy movement
+      if (!boundaryFiredRef.current) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const currentEst = Math.floor(elapsed * estimatedWPS);
+        if (currentEst > estimatedWordCount && currentEst < wordsInSegment.length) {
+          estimatedWordCount = currentEst;
+          const globalIdx = block.wordStartIndex + relOffset + estimatedWordCount;
+          if (globalIdx > wordIdxRef.current) {
+            setCurrentWordIndex(globalIdx);
           }
+        }
+      }
+    }, 50);
 
-          // Mobile-friendly recursive call
-          setTimeout(() => {
-            if (isPlayingRef.current) speakCurrentBlock();
-          }, 100);
-        } else {
-          setIsPlaying(false);
-          isPlayingRef.current = false;
+    utt.onboundary = (e) => {
+      if (e.name === 'word') {
+        boundaryFiredRef.current = true;
+        const charTxt = textSegment.substring(0, e.charIndex).trim();
+        const wordCount = charTxt ? charTxt.split(/\s+/).length : 0;
+        const globalWordIdx = block.wordStartIndex + relOffset + wordCount;
+        if (globalWordIdx > wordIdxRef.current) {
+          wordIdxRef.current = globalWordIdx;
+          setCurrentWordIndex(globalWordIdx);
         }
       }
     };
 
-    utterance.onerror = (e) => {
-      console.warn('TTS Engine Error:', e);
-      if (isPlayingRef.current) {
-         setTimeout(speakCurrentBlock, 500); // Retry after error
-      }
+    utt.onend = () => { 
+      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+      onSegmentFinish(); 
     };
-
-    window.speechSynthesis.speak(utterance);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockForWord, totalWords, saveProgress]);
+    utt.onerror = () => { 
+      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+      if (isPlayingRef.current) setTimeout(speak, 500); 
+    };
+    window.speechSynthesis.speak(utt);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, saveProgress, useNeuralTTS, speakNeural]);
 
   const togglePlayback = () => {
     if (isPlaying) {
       window.speechSynthesis.cancel();
+      if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} }
+      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
       setIsPlaying(false);
       isPlayingRef.current = false;
-      saveProgress(currentWordIndexRef.current);
     } else {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      speakCurrentBlock();
+      speak();
     }
   };
 
-  const jumpToWord = (idx: number) => {
-    currentWordIndexRef.current = idx;
+  const jumpTo = (idx: number) => {
+    wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
     saveProgress(idx);
-    if (isPlayingRef.current) {
+    if (isPlayingRef.current) { 
       window.speechSynthesis.cancel();
-      setTimeout(speakCurrentBlock, 150);
+      if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} }
+      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+      setTimeout(speak, 150); 
     }
   };
 
-  const seek = (amount: number) => {
-    const next = Math.max(0, Math.min(totalWords - 1, currentWordIndexRef.current + amount));
-    jumpToWord(next);
-  };
-
-  const handleFile = async (ev: React.ChangeEvent<HTMLInputElement>) => {
-    const file = ev.target.files?.[0];
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
     if (!file) return;
     setIsLoading(true);
-    setLoadingStatus("Decompressing Ebook...");
+    setLoadingStatus("Deconstructing Document...");
     try {
       const buffer = await file.arrayBuffer();
       const ext = file.name.split('.').pop()?.toLowerCase();
-      let extracted;
-      if (ext === 'epub') extracted = await extractEpub(buffer, setLoadingStatus);
-      else if (ext === 'pdf') extracted = await extractPdf(buffer, setLoadingStatus);
+      let result;
+      if (ext === 'epub') result = await extractEpub(buffer, setLoadingStatus);
+      else if (ext === 'pdf') result = await extractPdf(buffer, setLoadingStatus);
       else {
         const text = await file.text();
         const words = text.split(/\s+/).filter(w => w.length > 0);
-        extracted = { displayBlocks: [{ words, wordStartIndex: 0, wordCount: words.length }] as TextBlock[], chapters: [], metadata: { title: file.name } };
+        result = { displayBlocks: [{ words, wordStartIndex: 0, wordCount: words.length }], chapters: [], metadata: { title: file.name } };
       }
       const newBook: Book = {
         id: crypto.randomUUID(),
-        title: extracted.metadata?.title || file.name,
-        author: extracted.metadata?.creator || 'Unknown Author',
-        displayBlocks: extracted.displayBlocks,
-        chapters: extracted.chapters,
+        title: result.metadata?.title || file.name,
+        author: result.metadata?.creator || 'Unknown Source',
+        displayBlocks: result.displayBlocks,
+        chapters: result.chapters,
         lastPosition: 0,
         type: ext as any || 'txt',
         fileData: ext === 'pdf' ? buffer : undefined
@@ -538,57 +589,60 @@ const App = () => {
       await saveBookToDB(newBook);
       setBooks(prev => [...prev, newBook]);
       setActiveBook(newBook);
-      setView('reader');
-      currentWordIndexRef.current = 0;
+      wordIdxRef.current = 0;
       setCurrentWordIndex(0);
-    } catch (err: any) { setErrorMsg(err.message || "Failed to parse document."); } 
-    finally { setIsLoading(false); }
+      setView('reader');
+    } catch (err) {
+      setErrorMsg("Failed to process document. File might be encrypted.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const visibleBlocks = useMemo(() => {
     if (!activeBook) return [];
-    const currentBlockIdx = findBlockForWord(currentWordIndex);
-    return activeBook.displayBlocks.slice(Math.max(0, currentBlockIdx - 10), Math.min(activeBook.displayBlocks.length, currentBlockIdx + 25));
-  }, [activeBook, currentWordIndex, findBlockForWord]);
+    const idx = findBlockIdx(currentWordIndex);
+    return activeBook.displayBlocks.slice(Math.max(0, idx - 3), Math.min(activeBook.displayBlocks.length, idx + 8));
+  }, [activeBook, currentWordIndex, findBlockIdx]);
 
-  const themeClasses = {
-    light: "bg-[#fcfcfd] text-[#1a1a1b] border-zinc-200",
-    dark: "bg-[#0b0c0d] text-[#f0f0f0] border-zinc-800",
-    sepia: "bg-[#f4ebd4] text-[#4d3a2b] border-[#e4d4b8]"
+  const activeThemeClasses = {
+    light: "bg-zinc-50 text-zinc-900 border-zinc-200",
+    dark: "bg-zinc-950 text-zinc-100 border-zinc-800",
+    sepia: "bg-[#f4ebd1] text-[#4d3a2b] border-[#e1d2b0]"
   }[theme];
 
   return (
-    <div className={`fixed inset-0 flex flex-col transition-colors duration-700 overflow-hidden ${themeClasses}`}>
+    <div className={`fixed inset-0 flex flex-col transition-colors duration-500 overflow-hidden select-none touch-none ${activeThemeClasses}`}>
       
       {isLoading && (
-        <div className="fixed inset-0 z-[200] bg-black/95 backdrop-blur-3xl flex flex-col items-center justify-center text-white animate-in fade-in">
-          <Loader2 className="w-16 h-16 animate-spin text-blue-500 mb-8" />
-          <h2 className="text-3xl font-black mb-2 tracking-tighter">ReaderVerse Pro</h2>
-          <p className="opacity-40 text-[11px] tracking-[0.3em] uppercase font-bold">{loadingStatus}</p>
+        <div className="fixed inset-0 z-[200] bg-zinc-950/95 flex flex-col items-center justify-center text-white animate-in fade-in">
+          <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-8" />
+          <h2 className="text-xl font-black uppercase tracking-widest">{loadingStatus}</h2>
+          <p className="mt-2 text-[10px] opacity-30 uppercase tracking-[0.5em] animate-pulse">Synchronizing Neural Buffer</p>
         </div>
       )}
 
       {errorMsg && (
-        <div className="fixed inset-0 z-[300] bg-black/80 backdrop-blur-xl flex items-center justify-center p-8">
-          <div className="bg-white dark:bg-zinc-900 rounded-[3rem] p-10 max-w-sm w-full shadow-4xl text-center">
+        <div className="fixed inset-0 z-[300] bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm">
+          <div className="bg-white dark:bg-zinc-900 rounded-[3rem] p-10 max-w-xs w-full shadow-4xl text-center">
             <AlertCircle className="w-12 h-12 text-red-500 mb-6 mx-auto" />
-            <p className="text-sm opacity-60 mb-8">{errorMsg}</p>
-            <button onClick={() => setErrorMsg(null)} className="w-full py-4 bg-blue-600 text-white font-black rounded-2xl active:scale-95 transition-all">Retry</button>
+            <p className="text-sm font-bold opacity-80 leading-relaxed mb-10">{errorMsg}</p>
+            <button onClick={() => setErrorMsg(null)} className="w-full py-4 bg-blue-600 text-white font-black rounded-2xl active:scale-95 transition-all">Dismiss</button>
           </div>
         </div>
       )}
 
-      <header className={`h-20 flex items-center justify-between px-6 border-b z-50 transition-all ${themeClasses}`}>
+      <header className={`h-16 flex items-center justify-between px-5 border-b z-50 transition-colors ${activeThemeClasses}`}>
         <div className="flex items-center gap-4">
-          <div onClick={() => { window.speechSynthesis.cancel(); isPlayingRef.current = false; setView('library'); }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow-xl cursor-pointer active:scale-90 transition-all">
-            <BookOpen size={20} />
-          </div>
+          <button onClick={() => { window.speechSynthesis.cancel(); if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){} isPlayingRef.current = false; setView('library'); }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow active:scale-90 transition-transform">
+            <BookOpen size={18} />
+          </button>
           <div className="overflow-hidden">
-            <h1 className="text-xs font-black tracking-tight truncate max-w-[120px] leading-tight opacity-40 uppercase">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
+            <h1 className="text-[10px] font-black opacity-40 uppercase truncate max-w-[90px] tracking-tight">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
             {view === 'reader' && (
-              <div className="text-[10px] font-bold text-blue-600 truncate max-w-[160px] flex items-center gap-1.5 animate-in slide-in-from-left duration-300">
-                <Bookmark size={10} className="fill-blue-600" />
-                {readerMode === 'pdf' ? `Page ${currentPage}` : (currentChapter?.title || 'Main Story')}
+              <div className="text-[10px] font-black text-blue-600 truncate max-w-[130px] flex items-center gap-1.5 uppercase animate-in slide-in-from-left duration-300">
+                <Bookmark size={9} className="fill-blue-600" />
+                {readerMode === 'pdf' ? `P.${currentPage}` : (currentChapter?.title || 'STORY')}
               </div>
             )}
           </div>
@@ -598,122 +652,89 @@ const App = () => {
           {view === 'reader' && (
             <>
               {activeBook?.type === 'pdf' && (
-                <button 
-                  onClick={() => setReaderMode(prev => prev === 'pdf' ? 'reflow' : 'pdf')} 
-                  className={`p-2.5 rounded-xl transition-all ${readerMode === 'pdf' ? 'bg-blue-600 text-white shadow-lg' : 'bg-black/5 dark:bg-white/5'}`}
-                >
-                  {readerMode === 'pdf' ? <Headphones size={20} /> : <FileText size={20} />}
+                <button onClick={() => setReaderMode(p => p === 'pdf' ? 'reflow' : 'pdf')} className={`p-2.5 rounded-xl transition-all ${readerMode === 'pdf' ? 'bg-blue-600 text-white shadow' : 'bg-zinc-500/10'}`}>
+                  {readerMode === 'pdf' ? <Headphones size={18} /> : <FileText size={18} />}
                 </button>
               )}
-              <button onClick={() => setIsSidebarOpen(true)} className="p-2.5 rounded-xl bg-black/5 dark:bg-white/5 active:scale-90 transition-all"><List size={20} /></button>
-              <button onClick={() => setIsSettingsOpen(true)} className="p-2.5 rounded-xl bg-black/5 dark:bg-white/5 active:scale-90 transition-all"><Settings size={20} /></button>
+              <button onClick={() => setIsSidebarOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10 active:scale-90"><List size={18} /></button>
+              <button onClick={() => setIsSettingsOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10 active:scale-90"><Settings size={18} /></button>
             </>
           )}
           {view === 'library' && (
-            <label className="p-2.5 bg-blue-600 text-white rounded-xl shadow-lg cursor-pointer flex items-center gap-2 px-5 active:scale-95 transition-all">
-              <Plus size={18} /> <span className="text-[10px] font-black uppercase tracking-widest">Library</span>
-              <input type="file" className="hidden" accept=".epub,.pdf,.txt" onChange={handleFile} />
+            <label className="p-2.5 bg-blue-600 text-white rounded-xl shadow cursor-pointer flex items-center gap-2 px-4 active:scale-95 transition-all">
+              <Plus size={16} /> <span className="text-[10px] font-black uppercase tracking-widest">Add Book</span>
+              <input type="file" className="hidden" accept=".epub,.pdf,.txt" onChange={handleFileUpload} />
             </label>
           )}
         </div>
       </header>
 
-      <main className="flex-1 overflow-hidden relative">
+      <main className="flex-1 overflow-hidden relative touch-pan-y">
         {view === 'library' ? (
-          <div className="h-full overflow-y-auto p-6 no-scrollbar animate-in slide-in-from-bottom duration-500">
-            <div className="max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-2 gap-6">
-              {books.map(book => (
-                <div key={book.id} onClick={() => { setActiveBook(book); currentWordIndexRef.current = book.lastPosition || 0; setCurrentWordIndex(book.lastPosition || 0); setView('reader'); }} className={`group p-6 rounded-[2.5rem] border-2 cursor-pointer transition-all active:scale-[0.98] ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-100'}`}>
-                  <div className="flex items-center justify-between mb-6">
-                    <div className="w-10 h-10 bg-blue-600/10 text-blue-600 rounded-xl flex items-center justify-center font-black text-[10px] uppercase tracking-widest">{book.type}</div>
-                    <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(book.id); setBooks(b => b.filter(x => x.id !== book.id)); }} className="text-red-500 opacity-0 group-hover:opacity-40 hover:!opacity-100 p-2 transition-all"><Trash2 size={18}/></button>
-                  </div>
-                  <h3 className="text-xl font-black mb-1 line-clamp-2 tracking-tight transition-colors group-hover:text-blue-600">{book.title}</h3>
-                  <p className="text-[9px] uppercase font-bold tracking-[0.3em] opacity-30">{book.author}</p>
-                  <div className="mt-5 flex items-center gap-2 opacity-20">
-                    <Clock size={10} />
-                    <span className="text-[8px] font-black uppercase tracking-widest">Saved Progress: {book.lastPosition} words</span>
-                  </div>
+          <div className="h-full overflow-y-auto p-6 no-scrollbar bg-transparent">
+            <div className="max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-2 gap-4 pb-28">
+              {books.map(b => (
+                <div key={b.id} onClick={() => { setActiveBook(b); wordIdxRef.current = b.lastPosition || 0; setCurrentWordIndex(b.lastPosition || 0); setView('reader'); }} className={`p-6 rounded-[2.5rem] border-2 cursor-pointer transition-all active:scale-[0.98] ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 shadow-xl' : 'bg-white border-zinc-100 shadow-md'}`}>
+                   <div className="flex justify-between items-center mb-4">
+                     <span className="text-[9px] font-black uppercase text-blue-600 bg-blue-600/10 px-3 py-1 rounded-full">{b.type}</span>
+                     <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(prev => prev.filter(x => x.id !== b.id)); }} className="opacity-20 hover:opacity-100 p-2 text-red-500 transition-opacity"><Trash2 size={16}/></button>
+                   </div>
+                   <h3 className="text-lg font-black leading-tight line-clamp-2 mb-1 tracking-tight">{b.title}</h3>
+                   <p className="text-[9px] uppercase font-bold opacity-30 tracking-[0.2em]">{b.author}</p>
                 </div>
               ))}
-              {books.length === 0 && (
-                <div className="col-span-full py-32 text-center opacity-20 font-black uppercase tracking-[0.4em]">Shelf Empty</div>
-              )}
             </div>
           </div>
         ) : (
           <div className="h-full flex flex-col">
             {readerMode === 'reflow' ? (
-              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-6 py-20 no-scrollbar scroll-smooth">
-                <article className="max-w-xl mx-auto space-y-12 pb-[550px]">
-                  {visibleBlocks.map((block, i) => (
-                    <WordBlock 
-                      key={`${block.wordStartIndex}-${i}`} 
-                      block={block} 
-                      currentWordIndex={currentWordIndex} 
-                      onWordClick={jumpToWord} 
-                      fontSize={fontSize} 
-                      activeWordRef={activeWordRef}
-                    />
+              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-6 py-12 no-scrollbar scroll-smooth">
+                <article className="max-w-xl mx-auto space-y-12 pb-[400px]">
+                  {visibleBlocks.map((b, i) => (
+                    <WordBlock key={`${b.wordStartIndex}-${i}`} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
                   ))}
                 </article>
               </div>
             ) : (
-              <div className="flex-1 overflow-y-auto px-4 py-8 bg-zinc-100 dark:bg-zinc-950 no-scrollbar scroll-smooth">
+              <div className="flex-1 overflow-y-auto px-4 py-8 bg-zinc-100 dark:bg-zinc-900 no-scrollbar">
                 {pdfInstanceRef.current && (
-                  <div className="max-w-4xl mx-auto flex flex-col items-center">
+                  <div className="max-w-3xl mx-auto">
                     {Array.from({ length: pdfInstanceRef.current.numPages }).map((_, i) => (
-                      <PDFPage 
-                        key={i} 
-                        pdf={pdfInstanceRef.current!} 
-                        pageNum={i + 1} 
-                        scale={pdfScale} 
-                        onVisible={setCurrentPage} 
-                      />
+                      <PDFPage key={i} pdf={pdfInstanceRef.current!} pageNum={i + 1} scale={pdfScale} onVisible={setCurrentPage} />
                     ))}
                   </div>
                 )}
               </div>
             )}
             
-            <div className="absolute bottom-10 left-0 right-0 px-4 z-50 pointer-events-none">
-              <div className={`max-w-md mx-auto pointer-events-auto backdrop-blur-3xl border p-5 rounded-[4rem] shadow-4xl animate-in slide-in-from-bottom duration-500 ${theme === 'dark' ? 'bg-zinc-900/95 border-zinc-800' : 'bg-white/95 border-zinc-200'}`}>
+            <div className="absolute bottom-8 left-0 right-0 px-5 z-50">
+              <div className={`max-w-md mx-auto border p-5 rounded-[3.5rem] shadow-3xl ${theme === 'dark' ? 'bg-zinc-900/95 border-zinc-800' : 'bg-white/95 border-zinc-100'}`}>
                 {readerMode === 'reflow' ? (
                   <>
-                    <div className="w-full h-1.5 bg-black/5 dark:bg-white/10 rounded-full mb-6 overflow-hidden">
-                      <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_15px_rgba(37,99,235,0.7)]" style={{ width: `${(currentWordIndex / Math.max(1, totalWords)) * 100}%` }} />
+                    <div className="w-full h-1 bg-zinc-500/10 rounded-full mb-6 overflow-hidden">
+                      <div className="h-full bg-blue-600 transition-all duration-300" style={{ width: `${(currentWordIndex / Math.max(1, totalWords)) * 100}%` }} />
                     </div>
                     <div className="flex items-center justify-between">
-                      <button onClick={() => setIsSettingsOpen(true)} className="w-12 h-12 rounded-2xl bg-black/5 flex items-center justify-center hover:bg-black/10 active:scale-90 transition-all">
-                        <span className="text-[10px] font-black">{playbackSpeed}x</span>
-                      </button>
+                      <button onClick={() => setIsSettingsOpen(true)} className="w-11 h-11 rounded-2xl bg-zinc-500/5 flex items-center justify-center font-black text-[10px] active:scale-90 transition-transform">{playbackSpeed}x</button>
                       <div className="flex items-center gap-6">
-                        <button onClick={() => seek(-15)} className="opacity-30 active:scale-90 transition-all hover:opacity-60"><SkipBack size={30} fill="currentColor" /></button>
-                        <button onClick={togglePlayback} className="w-16 h-16 bg-blue-600 text-white rounded-[2.5rem] flex items-center justify-center shadow-2xl active:scale-90 transition-all">
-                          {isPlaying ? <Pause size={32} fill="currentColor" /> : <Play size={32} fill="currentColor" className="ml-1" />}
+                        <button onClick={() => jumpTo(Math.max(0, currentWordIndex - 30))} className="opacity-20 active:scale-90"><SkipBack size={26} fill="currentColor" /></button>
+                        <button onClick={togglePlayback} className="w-16 h-16 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-2xl active:scale-90 transition-all">
+                          {isPlaying ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="ml-1" />}
                         </button>
-                        <button onClick={() => seek(15)} className="opacity-30 active:scale-90 transition-all hover:opacity-60"><SkipForward size={30} fill="currentColor" /></button>
+                        <button onClick={() => jumpTo(Math.min(totalWords - 1, currentWordIndex + 30))} className="opacity-20 active:scale-90"><SkipForward size={26} fill="currentColor" /></button>
                       </div>
-                      <div className="w-12 h-12 flex flex-col items-center justify-center">
-                        <Clock size={16} className="opacity-20 mb-1" />
-                        <span className="text-[8px] font-black opacity-30">{Math.ceil((totalWords - currentWordIndex) / 165)}m</span>
-                      </div>
+                      <div className="w-11 h-11 flex items-center justify-center opacity-10"><Clock size={18} /></div>
                     </div>
                   </>
                 ) : (
-                  <div className="flex items-center justify-between px-3">
+                  <div className="flex items-center justify-between px-2">
                     <div className="flex items-center gap-3">
-                      <button onClick={() => setPdfScale(s => Math.max(0.5, s - 0.25))} className="p-3 bg-black/5 rounded-2xl active:scale-90"><ZoomOut size={18}/></button>
-                      <span className="text-[10px] font-black w-10 text-center tracking-tighter">{Math.round(pdfScale * 100)}%</span>
-                      <button onClick={() => setPdfScale(s => Math.min(3.5, s + 0.25))} className="p-3 bg-black/5 rounded-2xl active:scale-90"><ZoomIn size={18}/></button>
+                      <button onClick={() => setPdfScale(s => Math.max(0.5, s - 0.25))} className="p-3 bg-zinc-500/5 rounded-2xl active:scale-90"><ZoomOut size={16}/></button>
+                      <span className="text-[10px] font-black w-12 text-center">{Math.round(pdfScale * 100)}%</span>
+                      <button onClick={() => setPdfScale(s => Math.min(3.0, s + 0.25))} className="p-3 bg-zinc-500/5 rounded-2xl active:scale-90"><ZoomIn size={16}/></button>
                     </div>
-                    <div className="flex items-center gap-2">
-                       <button onClick={() => setPdfScale(1.0)} className="p-3 bg-black/5 rounded-2xl active:scale-90"><Maximize2 size={18}/></button>
-                       <div className="h-8 w-[1px] bg-black/10 mx-2" />
-                       <button onClick={() => setReaderMode('reflow')} className="p-3.5 bg-blue-600 text-white rounded-2xl flex items-center gap-2 shadow-lg active:scale-95 transition-all">
-                         <Headphones size={18} /> <span className="text-[10px] font-black uppercase">Reflow</span>
-                       </button>
-                    </div>
+                    <div className="h-8 w-[1px] bg-zinc-500/10 mx-2" />
+                    <button onClick={() => setReaderMode('reflow')} className="px-5 py-3 bg-blue-600 text-white rounded-2xl flex items-center gap-2 text-[10px] font-black active:scale-95 shadow-lg"><Headphones size={16} /> LISTEN</button>
                   </div>
                 )}
               </div>
@@ -723,78 +744,72 @@ const App = () => {
       </main>
 
       {isSidebarOpen && (
-        <div className="fixed inset-0 z-[100] flex">
-          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setIsSidebarOpen(false)} />
-          <div className={`relative w-[85%] max-w-xs h-full flex flex-col animate-in slide-in-from-left duration-400 ${themeClasses}`}>
-            <div className="p-8 border-b flex items-center justify-between">
-              <h2 className="text-xl font-black tracking-tighter">Manuscript Index</h2>
-              <button onClick={() => setIsSidebarOpen(false)} className="p-2 bg-black/5 rounded-full"><X size={20} /></button>
+        <div className="fixed inset-0 z-[100] flex animate-in fade-in duration-300">
+          <div className="absolute inset-0 bg-black/30" onClick={() => setIsSidebarOpen(false)} />
+          <div className={`relative w-[85%] max-w-xs h-full flex flex-col shadow-5xl animate-in slide-in-from-left duration-300 ${activeThemeClasses}`}>
+            <div className="p-7 border-b flex items-center justify-between">
+              <h2 className="text-sm font-black uppercase tracking-[0.2em]">Index</h2>
+              <button onClick={() => setIsSidebarOpen(false)} className="p-2 bg-zinc-500/10 rounded-full"><X size={18} /></button>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-2 no-scrollbar">
+            <div className="flex-1 overflow-y-auto p-4 space-y-1.5 no-scrollbar">
               {activeBook?.chapters.length ? activeBook.chapters.map((c, i) => {
                 const isActive = currentChapter?.startIndex === c.startIndex;
                 return (
-                  <button key={i} onClick={() => { 
-                    if (readerMode === 'pdf' && c.pageNumber) {
-                       const container = document.querySelector('.flex-1.overflow-y-auto.px-4');
-                       const targetPage = container?.querySelectorAll('.relative.mb-8')[c.pageNumber - 1];
-                       targetPage?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    } else {
-                       jumpToWord(c.startIndex);
-                    }
-                    setIsSidebarOpen(false); 
-                  }} className={`w-full text-left p-6 rounded-[2rem] text-[10px] font-bold transition-all ${isActive ? 'bg-blue-600 text-white shadow-xl' : 'opacity-40 bg-black/5 dark:bg-white/5 hover:opacity-100'}`}>
-                    <div className="flex justify-between items-center gap-4">
-                      <span className="truncate">{c.title}</span>
-                      {isActive && <Bookmark size={12} className="fill-white" />}
-                      {c.pageNumber && <span className="opacity-50 text-[8px] whitespace-nowrap tracking-widest">P.{c.pageNumber}</span>}
+                  <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-5 rounded-2xl text-[10px] font-bold transition-all ${isActive ? 'bg-blue-600 text-white shadow-xl translate-x-1' : 'opacity-40 bg-zinc-500/5'}`}>
+                    <div className="flex justify-between items-center">
+                      <span className="truncate pr-4 uppercase">{c.title}</span>
+                      {isActive && <ChevronRight size={14} />}
                     </div>
                   </button>
                 );
-              }) : <div className="p-10 text-center opacity-20 text-[10px] font-black uppercase tracking-[0.3em]">No Chapters Found</div>}
+              }) : <div className="p-16 text-center opacity-10 text-[9px] font-black uppercase tracking-[0.4em]">Empty Stack</div>}
             </div>
           </div>
         </div>
       )}
 
       {isSettingsOpen && (
-        <div className="fixed inset-0 z-[110] flex items-end justify-center">
-          <div className="absolute inset-0 bg-black/85 backdrop-blur-lg" onClick={() => setIsSettingsOpen(false)} />
-          <div className={`relative w-full rounded-t-[4rem] p-10 border-t animate-in slide-in-from-bottom duration-400 ${themeClasses}`}>
-            <div className="flex items-center justify-between mb-10">
-              <h2 className="text-2xl font-black tracking-tighter">Voice & Style</h2>
-              <button onClick={() => setIsSettingsOpen(false)} className="p-3 bg-black/5 rounded-full hover:bg-black/10 transition-all"><X size={20} /></button>
-            </div>
-            <div className="space-y-10">
-              <div>
-                <span className="text-[10px] font-black opacity-20 uppercase tracking-[0.3em] block mb-5">Interface Atmosphere</span>
-                <div className="grid grid-cols-3 gap-4">
-                  {(['light', 'dark', 'sepia'] as const).map(t => (
-                    <button key={t} onClick={() => setTheme(t)} className={`py-4 rounded-2xl capitalize font-black text-xs border-2 transition-all ${theme === t ? 'border-blue-600 bg-blue-600 text-white shadow-lg' : 'border-black/5 opacity-40 hover:opacity-70'}`}>{t}</button>
-                  ))}
+        <div className="fixed inset-0 z-[110] flex items-end animate-in fade-in duration-300">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setIsSettingsOpen(false)} />
+          <div className={`relative w-full rounded-t-[3.5rem] p-10 pb-12 border-t animate-in slide-in-from-bottom duration-300 ${activeThemeClasses}`}>
+             <div className="flex justify-between items-center mb-10">
+               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Config</h2>
+               <button onClick={() => setIsSettingsOpen(false)} className="p-3 bg-zinc-500/10 rounded-full"><X size={20} /></button>
+             </div>
+             <div className="space-y-10">
+                <div>
+                   <div className="flex justify-between items-center mb-5">
+                     <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Core Architecture</span>
+                     <button onClick={() => setUseNeuralTTS(!useNeuralTTS)} className={`px-4 py-2 rounded-full text-[9px] font-black uppercase flex items-center gap-2 transition-all ${useNeuralTTS ? 'bg-blue-600 text-white shadow-lg' : 'bg-zinc-500/10 opacity-40'}`}>
+                        {useNeuralTTS ? <Zap size={12} fill="white" /> : <Cpu size={12} />} {useNeuralTTS ? 'Neural Mode' : 'System Mode'}
+                     </button>
+                   </div>
+                   <div className="grid grid-cols-3 gap-3">
+                      {(['light', 'dark', 'sepia'] as const).map(t => (
+                        <button key={t} onClick={() => setTheme(t)} className={`py-4 rounded-2xl text-[11px] font-black capitalize border-2 transition-all ${theme === t ? 'border-blue-600 bg-blue-600 text-white shadow-md' : 'border-zinc-500/5 opacity-40'}`}>{t}</button>
+                      ))}
+                   </div>
                 </div>
-              </div>
-              <div>
-                <div className="flex justify-between mb-4"><span className="text-[10px] font-black opacity-20 uppercase tracking-[0.3em]">Temporal Rate</span> <span className="text-sm font-black text-blue-600">{playbackSpeed}x</span></div>
-                <input type="range" min="0.5" max="3.0" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full accent-blue-600 h-2.5 bg-black/5 rounded-full appearance-none cursor-pointer" />
-              </div>
-              <div className="pb-12">
-                <span className="text-[10px] font-black opacity-20 uppercase block mb-5 tracking-[0.3em]">Neural Identity Discovery</span>
-                <div className="max-h-52 overflow-y-auto space-y-2 no-scrollbar pr-1 custom-scrollbar">
-                  {availableVoices.length === 0 ? (
-                    <div className="py-6 text-center opacity-30 text-[10px] font-black uppercase animate-pulse">Scanning System Core...</div>
-                  ) : availableVoices.map(voice => (
-                    <button key={voice.voiceURI} onClick={() => setSelectedVoiceURI(voice.voiceURI)} className={`w-full flex items-center justify-between p-4 rounded-2xl text-[10px] font-black border-2 transition-all ${selectedVoiceURI === voice.voiceURI ? 'border-blue-600 bg-blue-600/5 text-blue-600 shadow-sm' : 'border-black/5 opacity-40 hover:opacity-100'}`}>
-                      <div className="flex flex-col items-start truncate pr-4">
-                        <span className="truncate">{voice.name}</span>
-                        <span className="text-[7px] opacity-40 uppercase tracking-widest">{voice.lang}</span>
-                      </div>
-                      {selectedVoiceURI === voice.voiceURI && <Check size={16} />}
-                    </button>
-                  ))}
+                <div>
+                  <div className="flex justify-between items-center mb-4"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Flow Velocity</span> <span className="text-xs font-black text-blue-600">{playbackSpeed}x</span></div>
+                  <input type="range" min="0.5" max="2.5" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-1.5 bg-blue-600/10 rounded-full appearance-none accent-blue-600" />
                 </div>
-              </div>
-            </div>
+                {!useNeuralTTS && (
+                  <div>
+                    <span className="text-[10px] font-black opacity-30 uppercase block mb-5 tracking-[0.3em]">System Identity</span>
+                    <div className="max-h-36 overflow-y-auto space-y-2 no-scrollbar pr-1 custom-scrollbar">
+                      {availableVoices.map(v => (
+                        <button key={v.voiceURI} onClick={() => setSelectedVoiceURI(v.voiceURI)} className={`w-full text-left p-4 rounded-2xl text-[10px] font-bold truncate transition-all ${selectedVoiceURI === v.voiceURI ? 'bg-blue-600/10 text-blue-600 border border-blue-600/20' : 'bg-zinc-500/5 opacity-40'}`}>
+                           <div className="flex items-center gap-3">
+                             <Volume2 size={12} className={selectedVoiceURI === v.voiceURI ? 'text-blue-600' : 'opacity-20'} />
+                             {v.name}
+                           </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+             </div>
           </div>
         </div>
       )}
