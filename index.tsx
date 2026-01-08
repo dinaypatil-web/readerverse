@@ -33,11 +33,11 @@ interface Book {
   chapters: ChapterEntry[];
   type: 'epub' | 'pdf' | 'txt' | 'demo';
   fileData?: ArrayBuffer;
-  lastIndex?: number; // Persisted progress
+  lastIndex?: number; 
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V33_STABLE';
+const DB_NAME = 'ReaderVerse_V35_STABLE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -360,6 +360,19 @@ const App = () => {
   const syncIntervalRef = useRef<number | null>(null);
   const speechSessionIdRef = useRef(0);
   const boundaryFiredRef = useRef(false);
+  const heartbeatRef = useRef<HTMLAudioElement | null>(null);
+
+  // Silent audio to prevent background suspension on mobile
+  useEffect(() => {
+    const audio = new Audio();
+    audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
+    audio.loop = true;
+    heartbeatRef.current = audio;
+    return () => {
+      audio.pause();
+      audio.src = "";
+    };
+  }, []);
 
   const initAudioContext = useCallback(() => {
     try {
@@ -389,7 +402,7 @@ const App = () => {
     }
   }, [activeBook]);
 
-  // Handle Media Session and background playback
+  // Handle Media Session and background controls
   useEffect(() => {
     if ('mediaSession' in navigator && activeBook) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -450,7 +463,6 @@ const App = () => {
     });
   }, []);
 
-  // Save progress on any interruption or app close
   useEffect(() => {
     const handleUnload = () => saveProgress();
     window.addEventListener('pagehide', handleUnload);
@@ -511,23 +523,16 @@ const App = () => {
   const findBlockIdx = useCallback((wIdx: number) => {
     if (!activeBook || activeBook.displayBlocks.length === 0) return 0;
     const blocks = activeBook.displayBlocks;
-    
     let low = 0, high = blocks.length - 1;
     while (low <= high) {
       const mid = (low + high) >>> 1;
       const b = blocks[mid];
-      // Check if word index is inside this block
       if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) {
         return mid;
       }
-      if (wIdx < b.wordStartIndex) {
-        high = mid - 1;
-      } else {
-        low = mid + 1;
-      }
+      if (wIdx < b.wordStartIndex) high = mid - 1;
+      else low = mid + 1;
     }
-    // If not found inside a block, return the 'low' index clipped to valid range
-    // This handles boundary cases where the index points to the start of a new block.
     return Math.max(0, Math.min(blocks.length - 1, low));
   }, [activeBook]);
 
@@ -580,6 +585,7 @@ const App = () => {
   }, [playbackSpeed, initAudioContext]);
 
   const speak = useCallback(async () => {
+    // 1. Session & Playback Status Check
     if (!activeBook || !isPlayingRef.current) return;
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
@@ -589,23 +595,23 @@ const App = () => {
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
     
+    // 2. Segment Alignment
     const relOffset = Math.max(0, sIdx - block.wordStartIndex);
-    // If we're at the very end of a block, move to the next one
     if (relOffset >= block.wordCount && bIdx < activeBook.displayBlocks.length - 1) {
         wordIdxRef.current = activeBook.displayBlocks[bIdx + 1].wordStartIndex;
         setCurrentWordIndex(wordIdxRef.current);
-        speak();
+        // Direct recursion with protection
+        setTimeout(() => { if (sessionId === speechSessionIdRef.current) speak(); }, 0);
         return;
     }
 
     const textSegment = block.words.slice(relOffset).join(" ").trim();
     if (!textSegment) {
-        // Skip empty segments immediately
         const nextWord = block.wordStartIndex + block.wordCount;
         if (nextWord < totalWords) {
             wordIdxRef.current = nextWord;
             setCurrentWordIndex(nextWord);
-            speak();
+            setTimeout(() => { if (sessionId === speechSessionIdRef.current) speak(); }, 0);
         }
         return;
     }
@@ -617,7 +623,7 @@ const App = () => {
         wordIdxRef.current = nextWord;
         setCurrentWordIndex(nextWord);
         saveProgress();
-        setTimeout(() => speak(), 50);
+        setTimeout(() => { if (sessionId === speechSessionIdRef.current) speak(); }, 50);
       } else {
         setIsPlaying(false);
         isPlayingRef.current = false;
@@ -625,10 +631,12 @@ const App = () => {
       }
     };
 
+    // 3. Neural Strategy
     if (useNeuralTTS && process.env.API_KEY) {
       try { await speakNeural(textSegment, sessionId, onSegmentFinish); return; } catch (e: any) { setUseNeuralTTS(false); }
     }
 
+    // 4. System Strategy
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(textSegment);
     const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
@@ -658,31 +666,36 @@ const App = () => {
     }, 100);
 
     utt.onboundary = (e) => {
+      // Critical check for session stale-ness
       if (sessionId !== speechSessionIdRef.current) return;
       if (e.name === 'word') {
         boundaryFiredRef.current = true;
         const charTxt = textSegment.substring(0, e.charIndex).trim();
         const wordCount = charTxt ? charTxt.split(/\s+/).length : 0;
         const globalWordIdx = block.wordStartIndex + relOffset + wordCount;
-        wordIdxRef.current = globalWordIdx;
-        setCurrentWordIndex(globalWordIdx);
+        
+        // Prevent backward jumps from asynchronous boundaries
+        if (globalWordIdx >= wordIdxRef.current) {
+            wordIdxRef.current = globalWordIdx;
+            setCurrentWordIndex(globalWordIdx);
+        }
       }
     };
 
     utt.onstart = () => {
       if (sessionId !== speechSessionIdRef.current) {
         window.speechSynthesis.cancel();
-      } else if ('mediaSession' in navigator) {
-        navigator.mediaSession.playbackState = 'playing';
+      } else {
+        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+        if (heartbeatRef.current) heartbeatRef.current.play().catch(() => {});
       }
     };
 
     utt.onend = () => { if (sessionId === speechSessionIdRef.current) onSegmentFinish(); };
     utt.onerror = (e) => { 
-      if (sessionId === speechSessionIdRef.current && e.error !== 'interrupted') {
-        onSegmentFinish();
-      }
+      if (sessionId === speechSessionIdRef.current && e.error !== 'interrupted') onSegmentFinish();
     };
+    
     window.speechSynthesis.speak(utt);
   }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, useNeuralTTS, speakNeural, saveProgress]);
 
@@ -697,30 +710,36 @@ const App = () => {
       if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
       speechSessionIdRef.current++;
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+      if (heartbeatRef.current) heartbeatRef.current.pause();
       saveProgress();
     } else {
       setIsPlaying(true);
       isPlayingRef.current = true;
       speechSessionIdRef.current++;
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      if (heartbeatRef.current) heartbeatRef.current.play().catch(() => {});
       speak();
     }
   };
 
   const jumpTo = (idx: number) => {
     initAudioContext();
+    // 1. Immediately invalidate current session to stop event processing
+    speechSessionIdRef.current++;
+    
+    // 2. Clear state and cancel engines
     window.speechSynthesis.cancel();
     if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
-    speechSessionIdRef.current++;
+    // 3. Set new position
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
     saveProgress();
     
-    // Tiny timeout to ensure the browser has actually cleared the speech synthesis buffer
+    // 4. Restart if active
     if (isPlayingRef.current) { 
-      setTimeout(() => speak(), 100); 
+      setTimeout(() => speak(), 50); 
     }
   };
 
@@ -811,6 +830,7 @@ const App = () => {
             if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){} 
             isPlayingRef.current = false; 
             speechSessionIdRef.current++;
+            if (heartbeatRef.current) heartbeatRef.current.pause();
             setView('library'); 
           }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow active:scale-90 transition-transform">
             <BookOpen size={18} />
