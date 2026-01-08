@@ -40,7 +40,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V45_BACKGROUND';
+const DB_NAME = 'ReaderVerse_V46_SYSTEM_SYNC';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -112,6 +112,20 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext): Promise<Aud
     channelData[i] = dataInt16[i] / 32768.0;
   }
   return buffer;
+}
+
+// Helper to find block index
+function findBlockIdx(wIdx: number, activeBook: Book | null) {
+  if (!activeBook?.displayBlocks.length) return 0;
+  const blocks = activeBook.displayBlocks;
+  let l = 0, r = blocks.length - 1;
+  while (l <= r) {
+    const m = (l + r) >>> 1;
+    const b = blocks[m];
+    if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) return m;
+    if (wIdx < b.wordStartIndex) r = m - 1; else l = m + 1;
+  }
+  return Math.max(0, Math.min(blocks.length - 1, l));
 }
 
 // --- Components ---
@@ -330,15 +344,50 @@ const App = () => {
   // Background audio anchor (Heartbeat)
   useEffect(() => {
     const audio = new Audio();
+    // 1-second silent WAV to keep media session active
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
     audio.loop = true;
     audio.preload = "auto";
     heartbeatRef.current = audio;
-    return () => { 
-      audio.pause(); 
-      audio.src = ""; 
-    };
+    return () => { audio.pause(); audio.src = ""; };
   }, []);
+
+  // Resilient Voice Loading logic
+  useEffect(() => {
+    const loadVoices = () => {
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        // Sort to put high quality voices first
+        const sorted = voices.sort((a, b) => {
+          const aNatural = a.name.includes('Natural') || a.name.includes('Online') || a.name.includes('Google');
+          const bNatural = b.name.includes('Natural') || b.name.includes('Online') || b.name.includes('Google');
+          if (aNatural && !bNatural) return -1;
+          if (!aNatural && bNatural) return 1;
+          return a.name.localeCompare(b.name);
+        });
+        setAvailableVoices(sorted);
+        // Default selection logic
+        if (!selectedVoiceURI) {
+          const preferred = sorted.find(v => v.lang.startsWith('en') && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Online'))) || sorted[0];
+          if (preferred) setSelectedVoiceURI(preferred.voiceURI);
+        }
+      }
+    };
+
+    // Initial load
+    loadVoices();
+    // Listen for async changes (common on Chrome/Mobile)
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    // Polling fallback for browsers that don't trigger the event reliably
+    const pollInterval = setInterval(loadVoices, 500);
+    const stopPolling = setTimeout(() => clearInterval(pollInterval), 5000);
+
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+      clearInterval(pollInterval);
+      clearTimeout(stopPolling);
+    };
+  }, [selectedVoiceURI]);
 
   const acquireWakeLock = useCallback(async () => {
     if ('wakeLock' in navigator) {
@@ -373,7 +422,7 @@ const App = () => {
     } catch (e) {}
   }, []);
 
-  const totalWords = useMemo(() => {
+  const totalWordsCount = useMemo(() => {
     if (!activeBook) return 0;
     const last = activeBook.displayBlocks[activeBook.displayBlocks.length - 1];
     return last ? last.wordStartIndex + last.wordCount : 0;
@@ -384,105 +433,11 @@ const App = () => {
     return [...activeBook.chapters].reverse().find(c => c.startIndex <= currentWordIndex) || activeBook.chapters[0];
   }, [activeBook, currentWordIndex]);
 
-  // --- Logic for Playback Routing (System Media Player Integration) ---
-
-  const jumpTo = (idx: number) => {
-    initAudioContext(); 
-    speechSessionIdRef.current++; 
-    window.speechSynthesis.cancel();
-    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-    const safeIdx = Math.max(0, Math.min(idx, totalWords - 1));
-    wordIdxRef.current = safeIdx; 
-    setCurrentWordIndex(safeIdx); 
-    saveProgress();
-    if (isPlayingRef.current) setTimeout(speak, 50);
-  };
-
-  const togglePlayback = useCallback(() => {
-    initAudioContext(); 
-    warmUpSpeech();
-    if (isPlayingRef.current) {
-      setIsPlaying(false); 
-      isPlayingRef.current = false;
-      window.speechSynthesis.cancel();
-      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-      speechSessionIdRef.current++;
-      if (heartbeatRef.current) heartbeatRef.current.pause();
-      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      releaseWakeLock();
-      saveProgress();
-    } else {
-      setIsPlaying(true); 
-      isPlayingRef.current = true;
-      speechSessionIdRef.current++;
-      if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
-      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-      acquireWakeLock();
-      speak();
-    }
-  }, [saveProgress, acquireWakeLock, releaseWakeLock]);
-
-  // Media Session - System Controls Sync
-  useEffect(() => {
-    if ('mediaSession' in navigator && activeBook) {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: activeBook.title,
-        artist: activeBook.author,
-        album: currentChapter?.title || 'Library',
-        artwork: [
-          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' },
-          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '192x192', type: 'image/png' }
-        ]
-      });
-
-      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
-
-      // Lock screen / Media hub progress tracking
-      try {
-        if ('setPositionState' in navigator.mediaSession) {
-          navigator.mediaSession.setPositionState({
-            duration: Math.max(totalWords, 1),
-            playbackRate: playbackSpeed,
-            position: currentWordIndex
-          });
-        }
-      } catch (e) {}
-
-      // Action Handlers
-      navigator.mediaSession.setActionHandler('play', () => togglePlayback());
-      navigator.mediaSession.setActionHandler('pause', () => togglePlayback());
-      navigator.mediaSession.setActionHandler('stop', () => {
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        window.speechSynthesis.cancel();
-        speechSessionIdRef.current++;
-      });
-      
-      navigator.mediaSession.setActionHandler('nexttrack', () => {
-        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 5);
-        if (next) jumpTo(next.startIndex);
-      });
-
-      navigator.mediaSession.setActionHandler('previoustrack', () => {
-        const prevs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 10);
-        if (prevs.length) jumpTo(prevs[prevs.length - 1].startIndex);
-      });
-
-      navigator.mediaSession.setActionHandler('seekto', (details) => {
-        if (details.seekTime !== undefined) jumpTo(Math.floor(details.seekTime));
-      });
-
-      navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(wordIdxRef.current - 100));
-      navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(wordIdxRef.current + 100));
-    }
-  }, [activeBook, isPlaying, currentChapter, totalWords, playbackSpeed, currentWordIndex, togglePlayback]);
-
-  // --- TTS Engine Core ---
+  // --- Core Speech Engine ---
 
   const speakNeuralGemini = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
     try {
       if (sessionId !== speechSessionIdRef.current) return;
-      // Initialize GoogleGenAI right before use with process.env.API_KEY directly
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const res = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
@@ -528,7 +483,6 @@ const App = () => {
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
     const sId = speechSessionIdRef.current;
-    // Added missing activeBook argument to findBlockIdx
     const bIdx = findBlockIdx(wordIdxRef.current, activeBook);
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
@@ -539,7 +493,7 @@ const App = () => {
     const finish = () => {
       if (sId !== speechSessionIdRef.current) return;
       const next = block.wordStartIndex + block.wordCount;
-      if (next < totalWords && isPlayingRef.current) {
+      if (next < totalWordsCount && isPlayingRef.current) {
         wordIdxRef.current = next;
         setCurrentWordIndex(next);
         saveProgress();
@@ -582,13 +536,106 @@ const App = () => {
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWords, ttsProvider, speakNeuralGemini, saveProgress]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgress]);
 
-  // --- Handlers & Lifecycle ---
+  // --- Handlers & Navigation ---
+
+  const jumpTo = useCallback((idx: number) => {
+    initAudioContext(); 
+    speechSessionIdRef.current++; 
+    window.speechSynthesis.cancel();
+    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+    const safeIdx = Math.max(0, Math.min(idx, totalWordsCount - 1));
+    wordIdxRef.current = safeIdx; 
+    setCurrentWordIndex(safeIdx); 
+    saveProgress();
+    if (isPlayingRef.current) setTimeout(speak, 50);
+  }, [totalWordsCount, speak, saveProgress, initAudioContext]);
+
+  const togglePlayback = useCallback(() => {
+    initAudioContext(); 
+    warmUpSpeech();
+    if (isPlayingRef.current) {
+      setIsPlaying(false); 
+      isPlayingRef.current = false;
+      window.speechSynthesis.cancel();
+      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+      speechSessionIdRef.current++;
+      if (heartbeatRef.current) heartbeatRef.current.pause();
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+      releaseWakeLock();
+      saveProgress();
+    } else {
+      setIsPlaying(true); 
+      isPlayingRef.current = true;
+      speechSessionIdRef.current++;
+      if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      acquireWakeLock();
+      speak();
+    }
+  }, [saveProgress, acquireWakeLock, releaseWakeLock, speak, initAudioContext, warmUpSpeech]);
+
+  // --- Media Session Synchronization ---
+  useEffect(() => {
+    if ('mediaSession' in navigator && activeBook) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: activeBook.title,
+        artist: activeBook.author,
+        album: currentChapter?.title || 'Collection',
+        artwork: [
+          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' },
+          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '192x192', type: 'image/png' }
+        ]
+      });
+
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+
+      // Update seek bar position in the system player
+      if ('setPositionState' in navigator.mediaSession) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: Math.max(totalWordsCount, 1),
+            playbackRate: playbackSpeed,
+            position: currentWordIndex
+          });
+        } catch (e) {}
+      }
+
+      // Handlers for Lock Screen Controls
+      navigator.mediaSession.setActionHandler('play', () => togglePlayback());
+      navigator.mediaSession.setActionHandler('pause', () => togglePlayback());
+      navigator.mediaSession.setActionHandler('stop', () => {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        window.speechSynthesis.cancel();
+        speechSessionIdRef.current++;
+      });
+      
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 50);
+        if (next) jumpTo(next.startIndex);
+      });
+
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        const prevs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 100);
+        if (prevs.length) jumpTo(prevs[prevs.length - 1].startIndex);
+      });
+
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime !== undefined) jumpTo(Math.floor(details.seekTime));
+      });
+
+      navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(wordIdxRef.current - 500));
+      navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(wordIdxRef.current + 500));
+    }
+  }, [activeBook, isPlaying, currentChapter, totalWordsCount, playbackSpeed, currentWordIndex, togglePlayback, jumpTo]);
+
+  // --- Library Management ---
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
-    setIsLoading(true); setLoadingStatus("Illuminating Manuscript...");
+    setIsLoading(true); setLoadingStatus("Synthesizing Narrative...");
     try {
       const buffer = await file.arrayBuffer();
       const ext = file.name.split('.').pop()?.toLowerCase();
@@ -608,7 +655,7 @@ const App = () => {
       setActiveBook(b); 
       jumpTo(0); 
       setView('reader');
-    } catch { setErrorMsg("Composition Error."); } finally { setIsLoading(false); }
+    } catch { setErrorMsg("Data Corrupted."); } finally { setIsLoading(false); }
   };
 
   const openBook = (b: Book) => { setActiveBook(b); jumpTo(b.lastIndex || 0); setView('reader'); };
@@ -688,7 +735,7 @@ const App = () => {
           {view === 'library' && (
             <label className="h-12 bg-blue-600 text-white rounded-2xl shadow-2xl cursor-pointer flex items-center gap-3 px-6 active:scale-95 transition-all group">
               <Plus size={20} className="group-hover:rotate-90 transition-transform" /> 
-              <span className="text-[12px] font-black uppercase tracking-widest">Library</span>
+              <span className="text-[12px] font-black uppercase tracking-widest">Import</span>
               <input type="file" className="hidden" accept=".epub,.pdf,.txt" onChange={handleFileUpload} />
             </label>
           )}
@@ -728,7 +775,6 @@ const App = () => {
             {readerMode === 'reflow' ? (
               <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-8 py-24 no-scrollbar scroll-smooth">
                 <article className="max-w-2xl mx-auto space-y-16 pb-[500px]">
-                  {/* Fixed missing activeBook argument to findBlockIdx */}
                   {activeBook?.displayBlocks.slice(Math.max(0, findBlockIdx(currentWordIndex, activeBook)-3), Math.min(activeBook.displayBlocks.length, findBlockIdx(currentWordIndex, activeBook)+8)).map((b) => (
                     <WordBlock key={`${b.wordStartIndex}`} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
                   ))}
@@ -752,13 +798,13 @@ const App = () => {
                 {readerMode === 'reflow' ? (
                   <>
                     <div className="w-full h-2 bg-zinc-500/10 rounded-full mb-8 overflow-hidden">
-                      <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_20px_rgba(37,99,235,0.6)]" style={{ width: `${(currentWordIndex / Math.max(1, totalWords)) * 100}%` }} />
+                      <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_20px_rgba(37,99,235,0.6)]" style={{ width: `${(currentWordIndex / Math.max(1, totalWordsCount)) * 100}%` }} />
                     </div>
                     <div className="flex items-center justify-between px-2">
                       <button onClick={() => setIsSettingsOpen(true)} className="w-14 h-14 rounded-3xl bg-zinc-500/5 flex items-center justify-center font-black text-xs active:scale-90 hover:bg-zinc-500/10 transition-all">{playbackSpeed}x</button>
                       <div className="flex items-center gap-10">
                         <button onClick={() => {
-                          const prevs = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 10);
+                          const prevs = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 100);
                           if (prevs?.length) jumpTo(prevs[prevs.length - 1].startIndex);
                         }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipBack size={32} fill="currentColor" /></button>
                         <button onClick={togglePlayback} className="w-24 h-24 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-[0_25px_50px_rgba(37,99,235,0.4)] hover:scale-105 active:scale-95 transition-all group">
@@ -767,7 +813,7 @@ const App = () => {
                             : <Play size={40} fill="currentColor" className="ml-2 group-active:scale-90 transition-transform" />}
                         </button>
                         <button onClick={() => {
-                          const next = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 5);
+                          const next = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 50);
                           if (next) jumpTo(next.startIndex);
                         }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipForward size={32} fill="currentColor" /></button>
                       </div>
@@ -842,10 +888,25 @@ const App = () => {
 
                 {ttsProvider === 'system' && (
                   <div className="space-y-6">
-                    <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Vocal Matrix</span>
+                    <div className="flex justify-between items-center">
+                      <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Vocal Matrix</span>
+                      <span className="text-[9px] font-black px-3 py-1 bg-green-500/10 text-green-500 rounded-full">{availableVoices.length} Loaded</span>
+                    </div>
                     <div className="relative">
-                        <select value={selectedVoiceURI} onChange={(e) => { setSelectedVoiceURI(e.target.value); initAudioContext(); warmUpSpeech(); }} className="w-full p-6 pr-12 rounded-[2.5rem] text-sm font-bold appearance-none bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none shadow-inner transition-all truncate">
-                        {availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural )/g, '')} ({v.lang})</option>)}
+                        <select 
+                          value={selectedVoiceURI} 
+                          onChange={(e) => { setSelectedVoiceURI(e.target.value); initAudioContext(); warmUpSpeech(); }} 
+                          className="w-full p-6 pr-12 rounded-[2.5rem] text-sm font-bold appearance-none bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none shadow-inner transition-all truncate dark:text-white"
+                        >
+                          {availableVoices.length === 0 ? (
+                            <option>Initializing Voice Engine...</option>
+                          ) : (
+                            availableVoices.map(v => (
+                              <option key={v.voiceURI} value={v.voiceURI}>
+                                {v.name.replace(/(Microsoft |Google |Natural |Online )/g, '')} ({v.lang})
+                              </option>
+                            ))
+                          )}
                         </select>
                         <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 rotate-90 opacity-40 pointer-events-none" />
                     </div>
@@ -873,19 +934,5 @@ const App = () => {
     </div>
   );
 };
-
-// --- Rendering ---
-function findBlockIdx(wIdx: number, activeBook: Book | null) {
-  if (!activeBook?.displayBlocks.length) return 0;
-  const blocks = activeBook.displayBlocks;
-  let l = 0, r = blocks.length - 1;
-  while (l <= r) {
-    const m = (l + r) >>> 1;
-    const b = blocks[m];
-    if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) return m;
-    if (wIdx < b.wordStartIndex) r = m - 1; else l = m + 1;
-  }
-  return Math.max(0, Math.min(blocks.length - 1, l));
-}
 
 createRoot(document.getElementById('root')!).render(<App />);
