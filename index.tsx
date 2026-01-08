@@ -1,10 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { 
-  Play, Pause, SkipForward, SkipBack, Settings, X, Check, 
-  List, Loader2, BookOpen, Trash2, Plus, Clock, Info, AlertCircle, 
-  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2, Globe,
-  Shield, Sparkles, Mic2, Layers, Search, MoreHorizontal, Layout
+  Play, Pause, SkipForward, SkipBack, Settings, X, 
+  List, Loader2, BookOpen, Trash2, Plus, FileText, Headphones, Bookmark, ChevronRight, Volume2, Globe, Zap
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -40,7 +38,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V51_BACKGROUND_SYNC';
+const DB_NAME = 'ReaderVerse_V52_PERF';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -146,7 +144,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
             key={wIdx} 
             ref={isCurrent ? activeWordRef : null}
             onClick={() => onWordClick(globalIdx)}
-            className={`word-highlight relative inline-block mr-[0.28em] px-1.5 py-0.5 rounded-lg cursor-pointer select-none touch-manipulation ${
+            className={`word-highlight relative inline-block mr-[0.28em] px-1.5 py-0.5 rounded-lg cursor-pointer select-none touch-manipulation transition-all duration-75 ${
               isCurrent 
                 ? 'bg-blue-600/10 text-blue-600 dark:text-blue-400 font-bold scale-110 z-20 shadow-[0_0_20px_rgba(37,99,235,0.15)] ring-1 ring-blue-600/20' 
                 : 'opacity-70 hover:opacity-100 dark:text-zinc-300'
@@ -159,9 +157,11 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
     </div>
   );
 }, (prev, next) => {
-  const prevIsVisible = prev.currentWordIndex >= prev.block.wordStartIndex && prev.currentWordIndex < prev.block.wordStartIndex + prev.block.wordCount;
-  const nextIsVisible = next.currentWordIndex >= next.block.wordStartIndex && next.currentWordIndex < next.block.wordStartIndex + next.block.wordCount;
-  if (!prevIsVisible && !nextIsVisible) return true;
+  const isTargetBlock = (idx: number, b: TextBlock) => idx >= b.wordStartIndex && idx < b.wordStartIndex + b.wordCount;
+  const prevWasIn = isTargetBlock(prev.currentWordIndex, prev.block);
+  const nextIsIn = isTargetBlock(next.currentWordIndex, next.block);
+  // Re-render ONLY if this block was or is currently the active speaking block
+  if (!prevWasIn && !nextIsIn) return prev.fontSize === next.fontSize;
   return prev.currentWordIndex === next.currentWordIndex && prev.fontSize === next.fontSize;
 });
 
@@ -224,7 +224,7 @@ function walkNodes(node: Node, results: string[]) {
 
 async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
   const book = e(buffer);
-  onStatus("Inhaling Manuscript...");
+  onStatus("Reading EPUB...");
   await book.opened;
   const metadata = await (book as any).loaded.metadata;
   const navigation = await (book as any).loaded.navigation;
@@ -277,13 +277,13 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
     } catch (e) {
       console.error("Spine error", e);
     }
-    if (i % 5 === 0) onStatus(`Processing Narrative... ${Math.round((i/spineItems.length)*100)}%`);
+    if (i % 5 === 0) onStatus(`Processing... ${Math.round((i/spineItems.length)*100)}%`);
   }
   return { displayBlocks, chapters: chapters.sort((a,b) => a.startIndex - b.startIndex), metadata };
 }
 
 async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
-  onStatus("Mapping PDF Layers...");
+  onStatus("Mapping PDF...");
   const pdf = await pdfjsLib.getDocument({ data: buffer, useSystemFonts: true }).promise;
   const displayBlocks: TextBlock[] = [];
   const chapters: ChapterEntry[] = [];
@@ -299,7 +299,7 @@ async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): P
       totalWords += words.length;
     }
     page.cleanup();
-    if (i % 10 === 0) onStatus(`Layering Page ${i}/${pdf.numPages}...`);
+    if (i % 10 === 0) onStatus(`Parsing PDF ${i}/${pdf.numPages}...`);
   }
   return { displayBlocks, chapters, metadata: await pdf.getMetadata() };
 }
@@ -332,18 +332,16 @@ const App = () => {
   const pdfInstanceRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const isPlayingRef = useRef(false);
   const wordIdxRef = useRef(0);
-  const scrollRequestRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const syncIntervalRef = useRef<number | null>(null);
   const speechSessionIdRef = useRef(0);
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
-  const wakeLockRef = useRef<any>(null);
+  const lastSavedIndexRef = useRef(0);
 
-  // Background audio anchor (Heartbeat) - CRITICAL for background play on mobile
+  // Background audio anchor (Heartbeat)
   useEffect(() => {
     const audio = new Audio();
-    // 1-second silent WAV to keep the browser media context alive
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
     audio.loop = true;
     audio.preload = "auto";
@@ -351,23 +349,22 @@ const App = () => {
     return () => { if (heartbeatRef.current) { heartbeatRef.current.pause(); heartbeatRef.current.src = ""; } };
   }, []);
 
-  // Resilient Voice Loading - Optimized to find all usable voices
+  // Optimized Voice Loading
   useEffect(() => {
     const loadVoices = () => {
       const voices = window.speechSynthesis.getVoices();
       if (voices.length > 0) {
-        // Filter out obviously non-speech voices if any, but keep all usable ones
-        const usable = voices.filter(v => v.lang !== "" && !v.name.includes("null"));
-        const sorted = usable.sort((a, b) => {
-          const aN = a.name.includes('Natural') || a.name.includes('Online') || a.name.includes('Google') || a.name.includes('Premium');
-          const bN = b.name.includes('Natural') || b.name.includes('Online') || b.name.includes('Google') || b.name.includes('Premium');
+        const sorted = voices.filter(v => v.lang !== "").sort((a, b) => {
+          const isNatural = (n: string) => n.includes('Natural') || n.includes('Online') || n.includes('Google') || n.includes('Premium');
+          const aN = isNatural(a.name);
+          const bN = isNatural(b.name);
           if (aN && !bN) return -1;
           if (!aN && bN) return 1;
           return a.name.localeCompare(b.name);
         });
         setAvailableVoices(sorted);
         if (!selectedVoiceURI) {
-          const pref = sorted.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Premium') || v.name.includes('Online'))) || sorted[0];
+          const pref = sorted.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Premium'))) || sorted[0];
           if (pref) setSelectedVoiceURI(pref.voiceURI);
         }
       }
@@ -384,17 +381,25 @@ const App = () => {
 
   const totalWordsCount = useMemo(() => {
     if (!activeBook) return 0;
-    const last = activeBook.displayBlocks[activeBook.displayBlocks.length - 1];
+    const blocks = activeBook.displayBlocks;
+    const last = blocks[blocks.length - 1];
     return last ? last.wordStartIndex + last.wordCount : 0;
   }, [activeBook]);
 
   const currentChapter = useMemo(() => {
     if (!activeBook?.chapters.length) return null;
-    return [...activeBook.chapters].reverse().find(c => c.startIndex <= currentWordIndex) || activeBook.chapters[0];
+    const chapters = activeBook.chapters;
+    for (let i = chapters.length - 1; i >= 0; i--) {
+      if (chapters[i].startIndex <= currentWordIndex) return chapters[i];
+    }
+    return chapters[0];
   }, [activeBook, currentWordIndex]);
 
-  const saveProgress = useCallback(() => {
-    if (activeBook) updateBookProgress(activeBook.id, wordIdxRef.current);
+  const saveProgressThrottled = useCallback(() => {
+    if (activeBook && Math.abs(wordIdxRef.current - lastSavedIndexRef.current) > 200) {
+      updateBookProgress(activeBook.id, wordIdxRef.current);
+      lastSavedIndexRef.current = wordIdxRef.current;
+    }
   }, [activeBook]);
 
   const initAudioContext = useCallback(() => {
@@ -445,8 +450,7 @@ const App = () => {
           lastW = cur; 
           const global = wordIdxRef.current + cur;
           setCurrentWordIndex(global); 
-          // Occasional position sync for lock screen
-          if (cur % 5 === 0) updateMediaSessionPosition();
+          if (cur % 8 === 0) updateMediaSessionPosition();
         }
       }, 50);
       src.onended = () => { 
@@ -473,7 +477,7 @@ const App = () => {
       if (next < totalWordsCount && isPlayingRef.current) {
         wordIdxRef.current = next;
         setCurrentWordIndex(next);
-        saveProgress();
+        saveProgressThrottled();
         setTimeout(() => { if (sId === speechSessionIdRef.current) speak(); }, 15);
       } else {
         setIsPlaying(false); isPlayingRef.current = false;
@@ -493,7 +497,8 @@ const App = () => {
     utt.rate = playbackSpeed;
     utt.onboundary = (e) => {
       if (sId !== speechSessionIdRef.current || e.name !== 'word') return;
-      const count = text.substring(0, e.charIndex).trim().split(/\s+/).filter(w => w.length > 0).length;
+      const subStr = text.substring(0, e.charIndex).trim();
+      const count = subStr ? subStr.split(/\s+/).length : 0;
       const global = block.wordStartIndex + offset + count;
       if (global >= wordIdxRef.current) { 
         wordIdxRef.current = global; 
@@ -510,7 +515,7 @@ const App = () => {
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgress, updateMediaSessionPosition]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition]);
 
   const jumpTo = useCallback((idx: number) => {
     initAudioContext();
@@ -520,10 +525,10 @@ const App = () => {
     const safeIdx = Math.max(0, Math.min(idx, totalWordsCount - 1));
     wordIdxRef.current = safeIdx;
     setCurrentWordIndex(safeIdx);
-    saveProgress();
     updateMediaSessionPosition();
+    if (activeBook) updateBookProgress(activeBook.id, safeIdx);
     if (isPlayingRef.current) setTimeout(speak, 50);
-  }, [totalWordsCount, speak, saveProgress, initAudioContext, updateMediaSessionPosition]);
+  }, [totalWordsCount, speak, activeBook, initAudioContext, updateMediaSessionPosition]);
 
   const togglePlayback = useCallback(() => {
     initAudioContext();
@@ -534,7 +539,7 @@ const App = () => {
       speechSessionIdRef.current++;
       if (heartbeatRef.current) heartbeatRef.current.pause();
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      saveProgress();
+      if (activeBook) updateBookProgress(activeBook.id, wordIdxRef.current);
     } else {
       setIsPlaying(true); isPlayingRef.current = true;
       speechSessionIdRef.current++;
@@ -542,45 +547,30 @@ const App = () => {
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
       speak();
     }
-  }, [speak, initAudioContext, saveProgress]);
+  }, [speak, initAudioContext, activeBook]);
 
-  // Deep MediaSession Sync for VLC-like behavior
+  // MediaSession Handlers
   useEffect(() => {
     if ('mediaSession' in navigator && activeBook) {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: activeBook.title,
         artist: activeBook.author,
         album: currentChapter?.title || 'Manuscript',
-        artwork: [
-          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' },
-          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '192x192', type: 'image/png' }
-        ]
+        artwork: [{ src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' }]
       });
-
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
       updateMediaSessionPosition();
-
       navigator.mediaSession.setActionHandler('play', togglePlayback);
       navigator.mediaSession.setActionHandler('pause', togglePlayback);
       navigator.mediaSession.setActionHandler('seekto', (d) => { if (d.seekTime !== undefined) jumpTo(Math.floor(d.seekTime)); });
       navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(wordIdxRef.current - 500));
       navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(wordIdxRef.current + 500));
-      
-      navigator.mediaSession.setActionHandler('nexttrack', () => {
-        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 50);
-        if (next) jumpTo(next.startIndex);
-      });
-
-      navigator.mediaSession.setActionHandler('previoustrack', () => {
-        const prevs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 100);
-        if (prevs.length) jumpTo(prevs[prevs.length - 1].startIndex);
-      });
     }
   }, [activeBook, isPlaying, currentChapter, updateMediaSessionPosition, togglePlayback, jumpTo]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
-    setIsLoading(true); setLoadingStatus("Ingesting...");
+    setIsLoading(true); setLoadingStatus("Optimizing narrative...");
     try {
       const buffer = await file.arrayBuffer();
       const ext = file.name.split('.').pop()?.toLowerCase();
@@ -600,7 +590,7 @@ const App = () => {
          pdfInstanceRef.current = await pdfjsLib.getDocument({ data: buffer }).promise;
          setReaderMode('pdf');
       } else setReaderMode('reflow');
-    } catch { setErrorMsg("Failed to parse."); } finally { setIsLoading(false); }
+    } catch { setErrorMsg("Import failed."); } finally { setIsLoading(false); }
   };
 
   const openBook = async (b: Book) => {
@@ -611,16 +601,27 @@ const App = () => {
     } else setReaderMode('reflow');
   };
 
+  // Performance Scroll Update
   useEffect(() => {
     if (view === 'reader' && readerMode === 'reflow' && activeWordRef.current && scrollContainerRef.current) {
-      const c = scrollContainerRef.current; const w = activeWordRef.current;
-      const t = c.getBoundingClientRect().bottom - 400;
-      const cur = w.getBoundingClientRect().top;
-      if (Math.abs(cur - t) > 60) c.scrollTo({ top: c.scrollTop + (cur - t), behavior: 'smooth' });
+      const c = scrollContainerRef.current;
+      const w = activeWordRef.current;
+      const targetY = c.getBoundingClientRect().bottom - 450;
+      const currentY = w.getBoundingClientRect().top;
+      if (Math.abs(currentY - targetY) > 50) {
+        c.scrollTo({ top: c.scrollTop + (currentY - targetY), behavior: isPlaying ? 'smooth' : 'auto' });
+      }
     }
-  }, [currentWordIndex, view, readerMode]);
+  }, [currentWordIndex, view, readerMode, isPlaying]);
 
   const activeTheme = { light: "bg-zinc-50 text-zinc-900", dark: "bg-zinc-950 text-zinc-100", sepia: "bg-[#fdf8ed] text-[#4d3a2b]" }[theme];
+
+  // Windowed Rendering for Reader Performance
+  const visibleBlocks = useMemo(() => {
+    if (!activeBook) return [];
+    const idx = findBlockIdx(currentWordIndex, activeBook);
+    return activeBook.displayBlocks.slice(Math.max(0, idx - 10), Math.min(activeBook.displayBlocks.length, idx + 20));
+  }, [activeBook, currentWordIndex]);
 
   return (
     <div className={`fixed inset-0 flex flex-col transition-all duration-700 overflow-hidden select-none touch-none ${activeTheme}`}>
@@ -656,8 +657,8 @@ const App = () => {
         <div className="flex items-center gap-3">
           {view === 'reader' && (
             <>
-              <button onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5"><List size={22} /></button>
-              <button onClick={() => setIsSettingsOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5"><Settings size={22} /></button>
+              <button onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 transition-all"><List size={22} /></button>
+              <button onClick={() => setIsSettingsOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 transition-all"><Settings size={22} /></button>
             </>
           )}
           {view === 'library' && (
@@ -683,14 +684,17 @@ const App = () => {
                   <p className="text-[10px] font-black opacity-30 uppercase tracking-widest">{b.type}</p>
                 </div>
               ))}
+              {books.length === 0 && (
+                <div className="col-span-full py-40 text-center opacity-20 uppercase font-black tracking-widest text-sm">Library Empty</div>
+              )}
             </div>
           </div>
         ) : (
           <div className="h-full flex flex-col">
             {readerMode === 'reflow' ? (
-              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-8 py-24 no-scrollbar">
-                <article className="max-w-2xl mx-auto space-y-16 pb-[400px]">
-                  {activeBook?.displayBlocks.map(b => (
+              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-8 py-24 no-scrollbar scroll-smooth">
+                <article className="max-w-2xl mx-auto space-y-16 pb-[450px]">
+                  {visibleBlocks.map(b => (
                     <WordBlock key={b.wordStartIndex} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
                   ))}
                 </article>
@@ -779,12 +783,16 @@ const App = () => {
                           onChange={e => { setSelectedVoiceURI(e.target.value); initAudioContext(); }} 
                           className="w-full p-6 rounded-[2.5rem] bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none font-bold appearance-none dark:text-white transition-all truncate"
                         >
-                          {availableVoices.length === 0 ? <option>Loading...</option> : availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural |Online )/g, '')} ({v.lang})</option>)}
+                          {availableVoices.length === 0 ? <option>Initializing...</option> : availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural |Online |Premium )/g, '')} ({v.lang})</option>)}
                         </select>
                         <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 rotate-90 opacity-40 pointer-events-none" />
                     </div>
                   </div>
                 )}
+                <div className="space-y-6">
+                  <div className="flex justify-between items-center"><span className="text-[11px] font-black opacity-30 uppercase tracking-widest">Typeface Size</span><span className="text-xl font-black text-blue-600">{fontSize}px</span></div>
+                  <input type="range" min="14" max="32" step="1" value={fontSize} onChange={e => setFontSize(parseInt(e.target.value))} className="w-full h-2 rounded-full appearance-none accent-blue-600 bg-zinc-500/10" />
+                </div>
                 <div className="space-y-6">
                    <span className="text-[11px] font-black opacity-30 uppercase tracking-widest block">Theme Gradient</span>
                    <div className="grid grid-cols-3 gap-4">
