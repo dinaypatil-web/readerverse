@@ -160,7 +160,6 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
   const isTargetBlock = (idx: number, b: TextBlock) => idx >= b.wordStartIndex && idx < b.wordStartIndex + b.wordCount;
   const prevWasIn = isTargetBlock(prev.currentWordIndex, prev.block);
   const nextIsIn = isTargetBlock(next.currentWordIndex, next.block);
-  // Re-render ONLY if this block was or is currently the active speaking block
   if (!prevWasIn && !nextIsIn) return prev.fontSize === next.fontSize;
   return prev.currentWordIndex === next.currentWordIndex && prev.fontSize === next.fontSize;
 });
@@ -338,6 +337,40 @@ const App = () => {
   const speechSessionIdRef = useRef(0);
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
   const lastSavedIndexRef = useRef(0);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
+  // Screen Wake Lock Logic
+  const requestWakeLock = useCallback(async () => {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLockRef.current = await navigator.wakeLock.request('screen');
+        console.debug('Wake lock acquired');
+        wakeLockRef.current.addEventListener('release', () => {
+          console.debug('Wake lock released');
+        });
+      }
+    } catch (err) {
+      console.error(`${err.name}, ${err.message}`);
+    }
+  }, []);
+
+  const releaseWakeLock = useCallback(async () => {
+    if (wakeLockRef.current) {
+      await wakeLockRef.current.release();
+      wakeLockRef.current = null;
+    }
+  }, []);
+
+  // Re-acquire wake lock if tab becomes visible and music is playing
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (wakeLockRef.current !== null && document.visibilityState === 'visible' && isPlayingRef.current) {
+        await requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [requestWakeLock]);
 
   // Background audio anchor (Heartbeat)
   useEffect(() => {
@@ -483,6 +516,7 @@ const App = () => {
         setIsPlaying(false); isPlayingRef.current = false;
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
         if (heartbeatRef.current) heartbeatRef.current.pause();
+        releaseWakeLock();
       }
     };
 
@@ -510,12 +544,13 @@ const App = () => {
       if (sId === speechSessionIdRef.current) {
         if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+        requestWakeLock();
       }
     };
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition, requestWakeLock, releaseWakeLock]);
 
   const jumpTo = useCallback((idx: number) => {
     initAudioContext();
@@ -540,14 +575,16 @@ const App = () => {
       if (heartbeatRef.current) heartbeatRef.current.pause();
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
       if (activeBook) updateBookProgress(activeBook.id, wordIdxRef.current);
+      releaseWakeLock();
     } else {
       setIsPlaying(true); isPlayingRef.current = true;
       speechSessionIdRef.current++;
       if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      requestWakeLock();
       speak();
     }
-  }, [speak, initAudioContext, activeBook]);
+  }, [speak, initAudioContext, activeBook, requestWakeLock, releaseWakeLock]);
 
   // MediaSession Handlers
   useEffect(() => {
@@ -648,6 +685,7 @@ const App = () => {
             isPlayingRef.current = false; 
             window.speechSynthesis.cancel(); 
             if (heartbeatRef.current) heartbeatRef.current.pause();
+            releaseWakeLock();
             setView('library'); 
           }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-xl active:scale-90 transition-all"><BookOpen size={24} /></button>
           <div className="overflow-hidden">
