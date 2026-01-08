@@ -37,7 +37,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V35_STABLE';
+const DB_NAME = 'ReaderVerse_V36_STABLE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -365,6 +365,7 @@ const App = () => {
   // Silent audio to prevent background suspension on mobile
   useEffect(() => {
     const audio = new Audio();
+    // 1 second of silence to keep audio hardware warm
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
     audio.loop = true;
     heartbeatRef.current = audio;
@@ -585,7 +586,7 @@ const App = () => {
   }, [playbackSpeed, initAudioContext]);
 
   const speak = useCallback(async () => {
-    // 1. Session & Playback Status Check
+    // 1. Session Protection
     if (!activeBook || !isPlayingRef.current) return;
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
@@ -595,12 +596,11 @@ const App = () => {
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
     
-    // 2. Segment Alignment
+    // 2. Exact word alignment
     const relOffset = Math.max(0, sIdx - block.wordStartIndex);
     if (relOffset >= block.wordCount && bIdx < activeBook.displayBlocks.length - 1) {
         wordIdxRef.current = activeBook.displayBlocks[bIdx + 1].wordStartIndex;
         setCurrentWordIndex(wordIdxRef.current);
-        // Direct recursion with protection
         setTimeout(() => { if (sessionId === speechSessionIdRef.current) speak(); }, 0);
         return;
     }
@@ -631,12 +631,12 @@ const App = () => {
       }
     };
 
-    // 3. Neural Strategy
+    // 3. Neural strategy
     if (useNeuralTTS && process.env.API_KEY) {
       try { await speakNeural(textSegment, sessionId, onSegmentFinish); return; } catch (e: any) { setUseNeuralTTS(false); }
     }
 
-    // 4. System Strategy
+    // 4. System Synthesis Strategy
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(textSegment);
     const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
@@ -666,7 +666,7 @@ const App = () => {
     }, 100);
 
     utt.onboundary = (e) => {
-      // Critical check for session stale-ness
+      // CRITICAL: Double-check session to prevent 'chapter jump' rubber-banding
       if (sessionId !== speechSessionIdRef.current) return;
       if (e.name === 'word') {
         boundaryFiredRef.current = true;
@@ -674,7 +674,7 @@ const App = () => {
         const wordCount = charTxt ? charTxt.split(/\s+/).length : 0;
         const globalWordIdx = block.wordStartIndex + relOffset + wordCount;
         
-        // Prevent backward jumps from asynchronous boundaries
+        // Strict index monotonicity check
         if (globalWordIdx >= wordIdxRef.current) {
             wordIdxRef.current = globalWordIdx;
             setCurrentWordIndex(globalWordIdx);
@@ -708,14 +708,14 @@ const App = () => {
       window.speechSynthesis.cancel();
       if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
       if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-      speechSessionIdRef.current++;
+      speechSessionIdRef.current++; // Invalidate session
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
       if (heartbeatRef.current) heartbeatRef.current.pause();
-      saveProgress();
+      saveProgress(); // Bookmark on pause
     } else {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      speechSessionIdRef.current++;
+      speechSessionIdRef.current++; // Start fresh session
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
       if (heartbeatRef.current) heartbeatRef.current.play().catch(() => {});
       speak();
@@ -724,20 +724,18 @@ const App = () => {
 
   const jumpTo = (idx: number) => {
     initAudioContext();
-    // 1. Immediately invalidate current session to stop event processing
+    // 1. Force kill current synthesis and sessions
     speechSessionIdRef.current++;
-    
-    // 2. Clear state and cancel engines
     window.speechSynthesis.cancel();
     if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
-    // 3. Set new position
+    // 2. Set new position AND bookmark immediately
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
-    saveProgress();
+    saveProgress(); 
     
-    // 4. Restart if active
+    // 3. Auto-resume if already playing, otherwise stay at bookmark
     if (isPlayingRef.current) { 
       setTimeout(() => speak(), 50); 
     }
