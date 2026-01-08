@@ -40,7 +40,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V44_LUXE';
+const DB_NAME = 'ReaderVerse_V45_BACKGROUND';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -170,7 +170,7 @@ const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDoc
       if (!canvasRef.current) return;
       try {
         const page = await pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale: scale * 1.5 }); // High-DPI
+        const viewport = page.getViewport({ scale: scale * 1.5 });
         const canvas = canvasRef.current;
         const context = canvas.getContext('2d', { alpha: false });
         if (!context) return;
@@ -193,7 +193,7 @@ const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDoc
   );
 });
 
-// --- Parsing ---
+// --- Parsing Functions ---
 
 function walkNodes(node: Node, results: string[]) {
   if (node.nodeType === Node.TEXT_NODE) {
@@ -291,7 +291,7 @@ async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): P
   return { displayBlocks, chapters, metadata: await pdf.getMetadata() };
 }
 
-// --- App ---
+// --- App Component ---
 
 const App = () => {
   const [books, setBooks] = useState<Book[]>([]);
@@ -324,16 +324,20 @@ const App = () => {
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const syncIntervalRef = useRef<number | null>(null);
   const speechSessionIdRef = useRef(0);
-  const boundaryFiredRef = useRef(false);
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
   const wakeLockRef = useRef<any>(null);
 
+  // Background audio anchor (Heartbeat)
   useEffect(() => {
     const audio = new Audio();
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
     audio.loop = true;
+    audio.preload = "auto";
     heartbeatRef.current = audio;
-    return () => { audio.pause(); audio.src = ""; };
+    return () => { 
+      audio.pause(); 
+      audio.src = ""; 
+    };
   }, []);
 
   const acquireWakeLock = useCallback(async () => {
@@ -351,11 +355,6 @@ const App = () => {
     }
   }, []);
 
-  useEffect(() => {
-    if (isPlaying) acquireWakeLock(); else releaseWakeLock();
-    return () => releaseWakeLock();
-  }, [isPlaying, acquireWakeLock, releaseWakeLock]);
-
   const saveProgress = useCallback(() => {
     if (activeBook) updateBookProgress(activeBook.id, wordIdxRef.current);
   }, [activeBook]);
@@ -366,7 +365,12 @@ const App = () => {
   }, []);
 
   const warmUpSpeech = useCallback(() => {
-    try { window.speechSynthesis.cancel(); const utt = new SpeechSynthesisUtterance(""); utt.volume = 0; window.speechSynthesis.speak(utt); } catch (e) {}
+    try { 
+      window.speechSynthesis.cancel(); 
+      const utt = new SpeechSynthesisUtterance(""); 
+      utt.volume = 0; 
+      window.speechSynthesis.speak(utt); 
+    } catch (e) {}
   }, []);
 
   const totalWords = useMemo(() => {
@@ -380,74 +384,106 @@ const App = () => {
     return [...activeBook.chapters].reverse().find(c => c.startIndex <= currentWordIndex) || activeBook.chapters[0];
   }, [activeBook, currentWordIndex]);
 
+  // --- Logic for Playback Routing (System Media Player Integration) ---
+
+  const jumpTo = (idx: number) => {
+    initAudioContext(); 
+    speechSessionIdRef.current++; 
+    window.speechSynthesis.cancel();
+    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+    const safeIdx = Math.max(0, Math.min(idx, totalWords - 1));
+    wordIdxRef.current = safeIdx; 
+    setCurrentWordIndex(safeIdx); 
+    saveProgress();
+    if (isPlayingRef.current) setTimeout(speak, 50);
+  };
+
+  const togglePlayback = useCallback(() => {
+    initAudioContext(); 
+    warmUpSpeech();
+    if (isPlayingRef.current) {
+      setIsPlaying(false); 
+      isPlayingRef.current = false;
+      window.speechSynthesis.cancel();
+      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+      speechSessionIdRef.current++;
+      if (heartbeatRef.current) heartbeatRef.current.pause();
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+      releaseWakeLock();
+      saveProgress();
+    } else {
+      setIsPlaying(true); 
+      isPlayingRef.current = true;
+      speechSessionIdRef.current++;
+      if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+      acquireWakeLock();
+      speak();
+    }
+  }, [saveProgress, acquireWakeLock, releaseWakeLock]);
+
+  // Media Session - System Controls Sync
   useEffect(() => {
     if ('mediaSession' in navigator && activeBook) {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: activeBook.title,
         artist: activeBook.author,
-        album: currentChapter?.title || 'ReaderVerse',
-        artwork: [{ src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' }]
+        album: currentChapter?.title || 'Library',
+        artwork: [
+          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' },
+          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '192x192', type: 'image/png' }
+        ]
       });
+
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+
+      // Lock screen / Media hub progress tracking
+      try {
+        if ('setPositionState' in navigator.mediaSession) {
+          navigator.mediaSession.setPositionState({
+            duration: Math.max(totalWords, 1),
+            playbackRate: playbackSpeed,
+            position: currentWordIndex
+          });
+        }
+      } catch (e) {}
+
+      // Action Handlers
       navigator.mediaSession.setActionHandler('play', () => togglePlayback());
       navigator.mediaSession.setActionHandler('pause', () => togglePlayback());
+      navigator.mediaSession.setActionHandler('stop', () => {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        window.speechSynthesis.cancel();
+        speechSessionIdRef.current++;
+      });
+      
       navigator.mediaSession.setActionHandler('nexttrack', () => {
-        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
+        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 5);
         if (next) jumpTo(next.startIndex);
       });
+
       navigator.mediaSession.setActionHandler('previoustrack', () => {
-        const prev = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
-        if (prev.length) jumpTo(prev[prev.length - 1].startIndex);
+        const prevs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 10);
+        if (prevs.length) jumpTo(prevs[prevs.length - 1].startIndex);
       });
+
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime !== undefined) jumpTo(Math.floor(details.seekTime));
+      });
+
+      navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(wordIdxRef.current - 100));
+      navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(wordIdxRef.current + 100));
     }
-  }, [activeBook, isPlaying, currentChapter]);
+  }, [activeBook, isPlaying, currentChapter, totalWords, playbackSpeed, currentWordIndex, togglePlayback]);
 
-  useEffect(() => {
-    const handleVis = () => { if (document.visibilityState === 'visible' && isPlaying) acquireWakeLock(); };
-    document.addEventListener('visibilitychange', handleVis);
-    return () => document.removeEventListener('visibilitychange', handleVis);
-  }, [isPlaying, acquireWakeLock]);
-
-  useEffect(() => {
-    const loadVoices = () => {
-      let voices = window.speechSynthesis.getVoices();
-      if (!voices.length) return;
-      const filtered = voices.filter(v => v.lang.toLowerCase().includes('en')).sort((a,b) => (a.name.includes('Online') || a.name.includes('Natural')) ? -1 : 1);
-      setAvailableVoices(filtered);
-      if (filtered.length && !selectedVoiceURI) setSelectedVoiceURI(filtered[0].voiceURI);
-    };
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-    const t = setInterval(loadVoices, 1000);
-    return () => { window.speechSynthesis.onvoiceschanged = null; clearInterval(t); };
-  }, [selectedVoiceURI]);
-
-  useEffect(() => {
-    getBooks().then(stored => {
-      setBooks(stored);
-      if (!stored.length) {
-        setBooks([{ id: 'demo', title: 'The Future of Reading', author: 'ReaderVerse AI', displayBlocks: [{ words: "Neural synthesis active. Welcome to a premium reading experience where technology meets literature.".split(" "), wordStartIndex: 0, wordCount: 15 }], chapters: [{ title: 'Begin', startIndex: 0 }], type: 'demo' }]);
-      }
-    });
-  }, []);
-
-  const findBlockIdx = useCallback((wIdx: number) => {
-    if (!activeBook?.displayBlocks.length) return 0;
-    const blocks = activeBook.displayBlocks;
-    let l = 0, r = blocks.length - 1;
-    while (l <= r) {
-      const m = (l + r) >>> 1;
-      const b = blocks[m];
-      if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) return m;
-      if (wIdx < b.wordStartIndex) r = m - 1; else l = m + 1;
-    }
-    return Math.max(0, Math.min(blocks.length - 1, l));
-  }, [activeBook]);
+  // --- TTS Engine Core ---
 
   const speakNeuralGemini = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
     try {
       if (sessionId !== speechSessionIdRef.current) return;
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      // Initialize GoogleGenAI right before use with process.env.API_KEY directly
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const res = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
         contents: [{ parts: [{ text }] }],
@@ -464,15 +500,25 @@ const App = () => {
       src.playbackRate.value = playbackSpeed;
       src.connect(ctx.destination);
       audioSourceRef.current = src;
+      
       const words = text.split(/\s+/).filter(w => w.length > 0);
       const wDur = (buffer.duration / playbackSpeed) / words.length;
-      let lastW = 0; const start = Date.now();
+      let lastW = 0; 
+      const start = Date.now();
+      
       syncIntervalRef.current = window.setInterval(() => {
         if (sessionId !== speechSessionIdRef.current) { clearInterval(syncIntervalRef.current!); return; }
         const cur = Math.floor(((Date.now() - start) / 1000) / wDur);
-        if (cur > lastW && cur < words.length) { lastW = cur; setCurrentWordIndex(wordIdxRef.current + cur); }
+        if (cur > lastW && cur < words.length) { 
+          lastW = cur; 
+          setCurrentWordIndex(wordIdxRef.current + cur); 
+        }
       }, 50);
-      src.onended = () => { if (syncIntervalRef.current) clearInterval(syncIntervalRef.current); if (sessionId === speechSessionIdRef.current) onEnd(); };
+
+      src.onended = () => { 
+        if (syncIntervalRef.current) clearInterval(syncIntervalRef.current); 
+        if (sessionId === speechSessionIdRef.current) onEnd(); 
+      };
       src.start();
     } catch (e) { throw e; }
   }, [playbackSpeed, initAudioContext]);
@@ -482,7 +528,8 @@ const App = () => {
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
     const sId = speechSessionIdRef.current;
-    const bIdx = findBlockIdx(wordIdxRef.current);
+    // Added missing activeBook argument to findBlockIdx
+    const bIdx = findBlockIdx(wordIdxRef.current, activeBook);
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
     
@@ -498,7 +545,8 @@ const App = () => {
         saveProgress();
         setTimeout(() => { if (sId === speechSessionIdRef.current) speak(); }, 15);
       } else {
-        setIsPlaying(false); isPlayingRef.current = false;
+        setIsPlaying(false); 
+        isPlayingRef.current = false;
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
       }
     };
@@ -506,23 +554,24 @@ const App = () => {
     if (ttsProvider === 'gemini' && process.env.API_KEY) {
       try { await speakNeuralGemini(text, sId, finish); return; } catch { setTtsProvider('system'); }
     } else if (ttsProvider === 'google-cloud' || ttsProvider === 'minimax') {
-        // Fallback for placeholders
         try { await speakNeuralGemini(text, sId, finish); return; } catch { setTtsProvider('system'); }
     }
 
+    // Default System TTS
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(text);
     const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
     if (v) utt.voice = v;
     utt.rate = playbackSpeed;
-    boundaryFiredRef.current = false;
 
     utt.onboundary = (e) => {
       if (sId !== speechSessionIdRef.current || e.name !== 'word') return;
-      boundaryFiredRef.current = true;
       const count = text.substring(0, e.charIndex).trim().split(/\s+/).filter(w => w.length > 0).length;
       const global = block.wordStartIndex + offset + count;
-      if (global >= wordIdxRef.current) { wordIdxRef.current = global; setCurrentWordIndex(global); }
+      if (global >= wordIdxRef.current) { 
+        wordIdxRef.current = global; 
+        setCurrentWordIndex(global); 
+      }
     };
     utt.onstart = () => { 
       if (sId === speechSessionIdRef.current) { 
@@ -533,33 +582,9 @@ const App = () => {
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, ttsProvider, speakNeuralGemini, saveProgress]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWords, ttsProvider, speakNeuralGemini, saveProgress]);
 
-  const togglePlayback = () => {
-    initAudioContext(); warmUpSpeech();
-    if (isPlaying) {
-      setIsPlaying(false); isPlayingRef.current = false;
-      window.speechSynthesis.cancel();
-      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-      speechSessionIdRef.current++;
-      if (heartbeatRef.current) heartbeatRef.current.pause();
-      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      saveProgress();
-    } else {
-      setIsPlaying(true); isPlayingRef.current = true;
-      speechSessionIdRef.current++;
-      if (heartbeatRef.current) heartbeatRef.current.play().catch(()=>{});
-      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-      speak();
-    }
-  };
-
-  const jumpTo = (idx: number) => {
-    initAudioContext(); speechSessionIdRef.current++; window.speechSynthesis.cancel();
-    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-    wordIdxRef.current = idx; setCurrentWordIndex(idx); saveProgress();
-    if (isPlayingRef.current) setTimeout(speak, 50);
-  };
+  // --- Handlers & Lifecycle ---
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
@@ -570,10 +595,19 @@ const App = () => {
       let res;
       if (ext === 'epub') res = await extractEpub(buffer, setLoadingStatus);
       else if (ext === 'pdf') res = await extractPdf(buffer, setLoadingStatus);
-      else { const words = (await file.text()).split(/\s+/).filter(w => w.length > 0); res = { displayBlocks: [{ words, wordStartIndex: 0, wordCount: words.length }], chapters: [], metadata: { title: file.name } }; }
+      else { 
+        const txt = await file.text();
+        const words = txt.split(/\s+/).filter(w => w.length > 0); 
+        res = { displayBlocks: [{ words, wordStartIndex: 0, wordCount: words.length }], chapters: [], metadata: { title: file.name } }; 
+      }
       const b: Book = { id: crypto.randomUUID(), title: res.metadata?.title || file.name, author: res.metadata?.creator || 'Unknown', displayBlocks: res.displayBlocks, chapters: res.chapters, type: ext as any || 'txt', fileData: ext === 'pdf' ? buffer : undefined, lastIndex: 0 };
-      const db = await initDB(); const tx = db.transaction(STORE_BOOKS, 'readwrite'); tx.objectStore(STORE_BOOKS).put(b);
-      setBooks(p => [...p, b]); setActiveBook(b); jumpTo(0); setView('reader');
+      const db = await initDB(); 
+      const tx = db.transaction(STORE_BOOKS, 'readwrite'); 
+      tx.objectStore(STORE_BOOKS).put(b);
+      setBooks(p => [...p, b]); 
+      setActiveBook(b); 
+      jumpTo(0); 
+      setView('reader');
     } catch { setErrorMsg("Composition Error."); } finally { setIsLoading(false); }
   };
 
@@ -583,7 +617,8 @@ const App = () => {
     if (view === 'reader' && readerMode === 'reflow' && activeWordRef.current && scrollContainerRef.current) {
       if (scrollRequestRef.current) cancelAnimationFrame(scrollRequestRef.current);
       scrollRequestRef.current = requestAnimationFrame(() => {
-        const c = scrollContainerRef.current; const w = activeWordRef.current;
+        const c = scrollContainerRef.current; 
+        const w = activeWordRef.current;
         if (!c || !w) return;
         const target = c.getBoundingClientRect().bottom - 380;
         const cur = w.getBoundingClientRect().top + w.getBoundingClientRect().height / 2;
@@ -622,7 +657,15 @@ const App = () => {
       {/* Header */}
       <header className="h-20 flex items-center justify-between px-8 z-50 glass">
         <div className="flex items-center gap-6">
-          <button onClick={() => { saveProgress(); setIsPlaying(false); isPlayingRef.current = false; speechSessionIdRef.current++; window.speechSynthesis.cancel(); if (heartbeatRef.current) heartbeatRef.current.pause(); setView('library'); }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-2xl active:scale-90 transition-all">
+          <button onClick={() => { 
+            saveProgress(); 
+            setIsPlaying(false); 
+            isPlayingRef.current = false; 
+            speechSessionIdRef.current++; 
+            window.speechSynthesis.cancel(); 
+            if (heartbeatRef.current) heartbeatRef.current.pause(); 
+            setView('library'); 
+          }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-2xl active:scale-90 transition-all">
             <BookOpen size={24} />
           </button>
           <div className="overflow-hidden">
@@ -685,7 +728,8 @@ const App = () => {
             {readerMode === 'reflow' ? (
               <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-8 py-24 no-scrollbar scroll-smooth">
                 <article className="max-w-2xl mx-auto space-y-16 pb-[500px]">
-                  {activeBook?.displayBlocks.slice(Math.max(0, findBlockIdx(currentWordIndex)-3), Math.min(activeBook.displayBlocks.length, findBlockIdx(currentWordIndex)+8)).map((b) => (
+                  {/* Fixed missing activeBook argument to findBlockIdx */}
+                  {activeBook?.displayBlocks.slice(Math.max(0, findBlockIdx(currentWordIndex, activeBook)-3), Math.min(activeBook.displayBlocks.length, findBlockIdx(currentWordIndex, activeBook)+8)).map((b) => (
                     <WordBlock key={`${b.wordStartIndex}`} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
                   ))}
                 </article>
@@ -714,8 +758,8 @@ const App = () => {
                       <button onClick={() => setIsSettingsOpen(true)} className="w-14 h-14 rounded-3xl bg-zinc-500/5 flex items-center justify-center font-black text-xs active:scale-90 hover:bg-zinc-500/10 transition-all">{playbackSpeed}x</button>
                       <div className="flex items-center gap-10">
                         <button onClick={() => {
-                          const prev = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
-                          if (prev?.length) jumpTo(prev[prev.length - 1].startIndex);
+                          const prevs = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 10);
+                          if (prevs?.length) jumpTo(prevs[prevs.length - 1].startIndex);
                         }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipBack size={32} fill="currentColor" /></button>
                         <button onClick={togglePlayback} className="w-24 h-24 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-[0_25px_50px_rgba(37,99,235,0.4)] hover:scale-105 active:scale-95 transition-all group">
                           {isPlaying 
@@ -723,7 +767,7 @@ const App = () => {
                             : <Play size={40} fill="currentColor" className="ml-2 group-active:scale-90 transition-transform" />}
                         </button>
                         <button onClick={() => {
-                          const next = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
+                          const next = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 5);
                           if (next) jumpTo(next.startIndex);
                         }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipForward size={32} fill="currentColor" /></button>
                       </div>
@@ -746,7 +790,7 @@ const App = () => {
         )}
       </main>
 
-      {/* Sidebar - Navigation */}
+      {/* Sidebar - Milestones */}
       {isSidebarOpen && (
         <div className="fixed inset-0 z-[100] flex animate-in fade-in duration-300">
           <div className="absolute inset-0 bg-black/40 backdrop-blur-md" onClick={() => setIsSidebarOpen(false)} />
@@ -766,7 +810,7 @@ const App = () => {
         </div>
       )}
 
-      {/* Settings - Config */}
+      {/* Settings Panel */}
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[110] flex items-end animate-in fade-in duration-500">
           <div className="absolute inset-0 bg-black/50 backdrop-blur-md" onClick={() => setIsSettingsOpen(false)} />
@@ -778,7 +822,6 @@ const App = () => {
              </div>
              
              <div className="max-w-2xl mx-auto space-y-14">
-                {/* Engine Selector */}
                 <div className="space-y-6">
                   <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Neural Core Provider</span>
                   <div className="grid grid-cols-2 gap-4">
@@ -797,7 +840,6 @@ const App = () => {
                   </div>
                 </div>
 
-                {/* Voice Selection */}
                 {ttsProvider === 'system' && (
                   <div className="space-y-6">
                     <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Vocal Matrix</span>
@@ -810,7 +852,6 @@ const App = () => {
                   </div>
                 )}
 
-                {/* Theme Selection */}
                 <div className="space-y-6">
                    <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Environment Gradient</span>
                    <div className="grid grid-cols-3 gap-4">
@@ -820,15 +861,10 @@ const App = () => {
                    </div>
                 </div>
 
-                {/* Flow Control */}
                 <div className="space-y-8">
                   <div className="flex justify-between items-center"><span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em]">Sync Speed</span><span className="text-lg font-black text-blue-600 bg-blue-600/10 px-4 py-1 rounded-full">{playbackSpeed}x</span></div>
                   <input type="range" min="0.5" max="3.0" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-2 rounded-full appearance-none accent-blue-600" />
                   <div className="flex justify-between px-1 opacity-20 text-[10px] font-black uppercase tracking-widest"><span>Adagio</span><span>Presto</span></div>
-                </div>
-                
-                <div className="pt-12 pb-4 border-t border-zinc-500/10 text-center opacity-20">
-                  <p className="text-[10px] font-black uppercase tracking-[0.6em]">ReaderVerse Luxe V44.0</p>
                 </div>
              </div>
           </div>
@@ -837,5 +873,19 @@ const App = () => {
     </div>
   );
 };
+
+// --- Rendering ---
+function findBlockIdx(wIdx: number, activeBook: Book | null) {
+  if (!activeBook?.displayBlocks.length) return 0;
+  const blocks = activeBook.displayBlocks;
+  let l = 0, r = blocks.length - 1;
+  while (l <= r) {
+    const m = (l + r) >>> 1;
+    const b = blocks[m];
+    if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) return m;
+    if (wIdx < b.wordStartIndex) r = m - 1; else l = m + 1;
+  }
+  return Math.max(0, Math.min(blocks.length - 1, l));
+}
 
 createRoot(document.getElementById('root')!).render(<App />);
