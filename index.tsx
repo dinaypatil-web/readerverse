@@ -31,14 +31,13 @@ interface Book {
   author: string;
   displayBlocks: TextBlock[];
   chapters: ChapterEntry[];
-  lastPosition: number;
   type: 'epub' | 'pdf' | 'txt' | 'demo';
   fileData?: ArrayBuffer;
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V20_STABLE';
-const STORE_NAME = 'books';
+const DB_NAME = 'ReaderVerse_V30_STABLE';
+const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
   return new Promise((resolve, reject) => {
@@ -46,8 +45,8 @@ const initDB = (): Promise<IDBDatabase> => {
       const request = indexedDB.open(DB_NAME, 1);
       request.onupgradeneeded = (ev: any) => {
         const db = ev.target.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        if (!db.objectStoreNames.contains(STORE_BOOKS)) {
+          db.createObjectStore(STORE_BOOKS, { keyPath: 'id' });
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -58,24 +57,20 @@ const initDB = (): Promise<IDBDatabase> => {
   });
 };
 
-const saveBookToDB = async (book: Book) => {
-  try {
-    const db = await initDB();
-    const transaction = db.transaction(STORE_NAME, 'readwrite');
-    transaction.objectStore(STORE_NAME).put(book);
-  } catch (err) {
-    console.error("Storage Error:", err);
-  }
+const saveBookContent = async (book: Book) => {
+  const db = await initDB();
+  const tx = db.transaction(STORE_BOOKS, 'readwrite');
+  tx.objectStore(STORE_BOOKS).put(book);
 };
 
 const getBooks = async (): Promise<Book[]> => {
   try {
     const db = await initDB();
     return new Promise((resolve) => {
-      const transaction = db.transaction(STORE_NAME, 'readonly');
-      const request = transaction.objectStore(STORE_NAME).getAll();
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => resolve([]);
+      const tx = db.transaction(STORE_BOOKS, 'readonly');
+      const req = tx.objectStore(STORE_BOOKS).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve([]);
     });
   } catch (e) {
     return [];
@@ -83,12 +78,8 @@ const getBooks = async (): Promise<Book[]> => {
 };
 
 const removeBookFromDB = async (id: string) => {
-  try {
-    const db = await initDB();
-    db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME).delete(id);
-  } catch (e) {
-    console.error("Delete Error:", e);
-  }
+  const db = await initDB();
+  db.transaction(STORE_BOOKS, 'readwrite').objectStore(STORE_BOOKS).delete(id);
 };
 
 // --- Audio Decoding Utilities ---
@@ -121,7 +112,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
   activeWordRef: React.RefObject<HTMLSpanElement | null>
 }) => {
   return (
-    <p className="font-serif leading-relaxed text-left will-change-contents mb-6" style={{ fontSize: `${fontSize}px` }}>
+    <p className="font-serif leading-relaxed text-left will-change-transform mb-8" style={{ fontSize: `${fontSize}px` }}>
       {block.words.map((word, wIdx) => {
         const globalIdx = block.wordStartIndex + wIdx;
         const isCurrent = currentWordIndex === globalIdx;
@@ -130,7 +121,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
             key={wIdx} 
             ref={isCurrent ? activeWordRef : null}
             onClick={() => onWordClick(globalIdx)}
-            className={`inline-block mr-[0.2em] px-1 rounded-md transition-all duration-75 cursor-pointer select-none touch-manipulation ${isCurrent ? 'bg-blue-600 text-white font-bold shadow-md' : 'opacity-60 hover:opacity-100'}`}
+            className={`relative inline-block mr-[0.22em] px-1.5 py-0.5 rounded-lg transition-all duration-75 cursor-pointer select-none touch-manipulation ${isCurrent ? 'bg-blue-600 text-white font-bold shadow-xl scale-110 z-20' : 'opacity-60 hover:opacity-100'}`}
           >
             {word}
           </span>
@@ -200,6 +191,36 @@ function walkNodes(node: Node, results: string[]) {
   }
 }
 
+/**
+ * Calculates the word offset of a specific element ID within a document.
+ */
+function getWordOffsetOfId(doc: Document, id: string): number {
+  if (!id) return 0;
+  // Handle case-insensitivity and name attributes which are common in older EPUBs
+  const target = doc.getElementById(id) || 
+                 doc.querySelector(`[name="${id}"]`) || 
+                 doc.querySelector(`[id="${id.toLowerCase()}"]`) ||
+                 doc.querySelector(`[name="${id.toLowerCase()}"]`);
+                 
+  if (!target) return 0;
+  
+  let count = 0;
+  const walker = doc.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, null);
+  
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node === target) break;
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent?.trim();
+      if (text) {
+        const words = text.split(/\s+/).filter(w => w.length > 0);
+        count += words.length;
+      }
+    }
+  }
+  return count;
+}
+
 async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
   const book = e(buffer);
   onStatus("Inhaling...");
@@ -207,6 +228,10 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
   const metadata = await (book as any).loaded.metadata;
   const navigation = await (book as any).loaded.navigation;
   const toc = navigation?.toc || [];
+  
+  const getCanonical = (p: string) => p?.split('#')[0].replace(/(\.\.\/|\.\/)/g, '').toLowerCase() || '';
+  const getAnchor = (p: string) => p?.includes('#') ? p.split('#')[1] : '';
+
   const chapters: ChapterEntry[] = [];
   const displayBlocks: TextBlock[] = [];
   let totalWordCount = 0;
@@ -222,30 +247,54 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
       const rawHtml = await book.archive.getText(url);
       if (!rawHtml) continue;
       const doc = new DOMParser().parseFromString(rawHtml, "text/html");
-      const parts: string[] = [];
-      walkNodes(doc.body || doc.documentElement, parts);
       
-      const itemHref = item.href?.split('#')[0].replace(/^\.\//, '');
-      const match = toc.find((t: any) => {
-        const tHref = t.href?.split('#')[0].replace(/^\.\//, '');
+      const itemHref = getCanonical(item.href || '');
+      
+      // Collect all TOC entries associated with this file
+      const matches = toc.filter((t: any) => {
+        const tHref = getCanonical(t.href || '');
         return itemHref === tHref || itemHref.endsWith(tHref) || tHref.endsWith(itemHref);
       });
-      if (match) chapters.push({ title: match.label?.trim() || `Chapter ${chapters.length + 1}`, startIndex: totalWordCount });
 
+      for (const match of matches) {
+        const anchor = getAnchor(match.href || '');
+        const offset = anchor ? getWordOffsetOfId(doc, anchor) : 0;
+        const title = match.label?.trim() || `Chapter ${chapters.length + 1}`;
+        const startIndex = totalWordCount + offset;
+        
+        // Ensure strictly increasing indices or update existing title if at same position
+        const lastCh = chapters[chapters.length - 1];
+        if (!lastCh || lastCh.startIndex !== startIndex) {
+          chapters.push({ title, startIndex });
+        }
+      }
+
+      // Extract text content
+      const parts: string[] = [];
+      walkNodes(doc.body || doc.documentElement, parts);
       const text = parts.join(" ").replace(/\s+/g, ' ').trim();
+      
       if (text) {
-        text.split(/\n+/).forEach(p => {
+        const splitParas = text.split(/\n+/);
+        let spineWordCount = 0;
+        for (const p of splitParas) {
           const words = p.trim().split(/\s+/).filter(w => w.length > 0);
           if (words.length > 0) {
-            displayBlocks.push({ words, wordStartIndex: totalWordCount, wordCount: words.length });
-            totalWordCount += words.length;
+            displayBlocks.push({ words, wordStartIndex: totalWordCount + spineWordCount, wordCount: words.length });
+            spineWordCount += words.length;
           }
-        });
+        }
+        totalWordCount += spineWordCount;
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error("Error parsing spine item", e);
+    }
     if (i % 5 === 0) { onStatus(`Parsing ${i+1}/${spineItems.length}...`); await new Promise(r => setTimeout(r, 0)); }
   }
-  return { displayBlocks, chapters, metadata };
+
+  // Final validation
+  const validatedChapters = chapters.sort((a, b) => a.startIndex - b.startIndex);
+  return { displayBlocks, chapters: validatedChapters, metadata };
 }
 
 async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
@@ -302,9 +351,9 @@ const App = () => {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const syncIntervalRef = useRef<number | null>(null);
+  const speechSessionIdRef = useRef(0);
   const boundaryFiredRef = useRef(false);
 
-  // Initialize Voices
   useEffect(() => {
     const loadVoices = () => {
       const voices = window.speechSynthesis.getVoices();
@@ -322,7 +371,6 @@ const App = () => {
     return () => { window.speechSynthesis.onvoiceschanged = null; clearInterval(interval); };
   }, [selectedVoiceURI]);
 
-  // Load Persistence
   useEffect(() => {
     getBooks().then(stored => {
       setBooks(stored);
@@ -331,23 +379,38 @@ const App = () => {
           id: 'demo', 
           title: 'ReaderVerse Pro', 
           author: 'ElevenReaders Studio', 
-          displayBlocks: [{ words: "Neural-grade synchronicity enabled. Tap any word to jump. This reader handles heavy EPUBs and PDFs with mobile-optimized memory usage. Hit play to listen to the future.".split(" "), wordStartIndex: 0, wordCount: 29 }], 
+          displayBlocks: [{ words: "Neural-grade synchronicity enabled. Tap any word to jump. Hit play to listen to the future.".split(" "), wordStartIndex: 0, wordCount: 16 }], 
           chapters: [{ title: 'Overview', startIndex: 0 }], 
-          lastPosition: 0, 
           type: 'demo' 
         }]);
       }
     });
   }, []);
 
-  // PDF Pre-load
+  useEffect(() => {
+    const handleInterruption = () => {
+      if (isPlayingRef.current) {
+        window.speechSynthesis.cancel();
+        if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        speechSessionIdRef.current++;
+      }
+    };
+    window.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') handleInterruption(); });
+    window.addEventListener('blur', handleInterruption);
+    return () => {
+      window.removeEventListener('visibilitychange', handleInterruption);
+      window.removeEventListener('blur', handleInterruption);
+    };
+  }, []);
+
   useEffect(() => {
     if (activeBook?.type === 'pdf' && activeBook.fileData) {
       pdfjsLib.getDocument({ data: activeBook.fileData }).promise.then(p => pdfInstanceRef.current = p);
     }
   }, [activeBook]);
 
-  // Precision Mobile Auto-Scroll
   useEffect(() => {
     if (view === 'reader' && readerMode === 'reflow' && activeWordRef.current && scrollContainerRef.current) {
       if (scrollRequestRef.current) cancelAnimationFrame(scrollRequestRef.current);
@@ -373,11 +436,21 @@ const App = () => {
   }, [activeBook]);
 
   const currentChapter = useMemo(() => {
-    if (!activeBook) return null;
+    if (!activeBook || activeBook.chapters.length === 0) return null;
     let ch = activeBook.chapters[0];
-    for (const c of activeBook.chapters) {
-      if (currentWordIndex >= c.startIndex) ch = c;
-      else break;
+    let low = 0;
+    let high = activeBook.chapters.length - 1;
+    
+    // Find the first chapter that satisfies startIndex <= currentWordIndex
+    // If multiple have the same index, we want the most recent one for that specific location
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      if (activeBook.chapters[mid].startIndex <= currentWordIndex) {
+        ch = activeBook.chapters[mid];
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
     }
     return ch;
   }, [activeBook, currentWordIndex]);
@@ -394,14 +467,9 @@ const App = () => {
     return 0;
   }, [activeBook]);
 
-  const saveProgress = useCallback((idx: number) => {
-    if (activeBook) { activeBook.lastPosition = idx; saveBookToDB(activeBook); }
-  }, [activeBook]);
-
-  // --- Hybrid Mobile Sync TTS Engine ---
-
-  const speakNeural = useCallback(async (text: string, onEnd: () => void) => {
+  const speakNeural = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
     try {
+      if (sessionId !== speechSessionIdRef.current) return;
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       const res = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
@@ -411,52 +479,46 @@ const App = () => {
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } } } 
         },
       });
+      if (sessionId !== speechSessionIdRef.current) return;
       const b64 = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!b64) throw new Error("Audio generation failed");
-      
+      if (!b64) throw new Error("Audio failed");
       if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       const ctx = audioCtxRef.current;
       const buffer = await decodeAudioData(decodeBase64(b64), ctx);
-      
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.playbackRate.value = playbackSpeed;
       src.connect(ctx.destination);
       audioSourceRef.current = src;
-      
       const words = text.split(/\s+/).filter(w => w.length > 0);
       const wordDuration = (buffer.duration / playbackSpeed) / words.length;
       let lastHeard = 0;
       const startTime = Date.now();
       
       syncIntervalRef.current = window.setInterval(() => {
+        if (sessionId !== speechSessionIdRef.current) {
+          clearInterval(syncIntervalRef.current!);
+          return;
+        }
         const curW = Math.floor(((Date.now() - startTime) / 1000) / wordDuration);
         if (curW > lastHeard && curW < words.length) { 
           lastHeard = curW; 
           setCurrentWordIndex(wordIdxRef.current + curW); 
         }
-      }, 40);
-
+      }, 50);
       src.onended = () => { 
         if (syncIntervalRef.current) clearInterval(syncIntervalRef.current); 
-        onEnd(); 
+        if (sessionId === speechSessionIdRef.current) onEnd(); 
       };
       src.start();
-    } catch (e) {
-      console.error("Neural TTS failed:", e);
-      setUseNeuralTTS(false); 
-      setIsPlaying(false);
-      isPlayingRef.current = false;
-    }
+    } catch (e: any) { throw e; }
   }, [playbackSpeed]);
 
-  const speak = useCallback(() => {
+  const speak = useCallback(async () => {
     if (!activeBook || !isPlayingRef.current) return;
-    
-    window.speechSynthesis.cancel();
-    if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} audioSourceRef.current = null; }
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-
+    
+    const sessionId = speechSessionIdRef.current;
     const sIdx = wordIdxRef.current;
     const bIdx = findBlockIdx(sIdx);
     const block = activeBook.displayBlocks[bIdx];
@@ -464,14 +526,14 @@ const App = () => {
     
     const relOffset = sIdx - block.wordStartIndex;
     const textSegment = block.words.slice(relOffset).join(" ");
-
+    
     const onSegmentFinish = () => {
+      if (sessionId !== speechSessionIdRef.current) return;
       const nextWord = block.wordStartIndex + block.wordCount;
-      if (nextWord < totalWords) {
+      if (nextWord < totalWords && isPlayingRef.current) {
         wordIdxRef.current = nextWord;
         setCurrentWordIndex(nextWord);
-        saveProgress(nextWord);
-        setTimeout(() => { if (isPlayingRef.current) speak(); }, 80);
+        setTimeout(() => speak(), 50);
       } else {
         setIsPlaying(false);
         isPlayingRef.current = false;
@@ -479,84 +541,78 @@ const App = () => {
     };
 
     if (useNeuralTTS && process.env.API_KEY) {
-      speakNeural(textSegment, onSegmentFinish);
-      return;
+      try { await speakNeural(textSegment, sessionId, onSegmentFinish); return; } catch (e: any) { setUseNeuralTTS(false); }
     }
 
+    window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(textSegment);
     const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI);
     if (v) utt.voice = v;
     utt.rate = playbackSpeed;
     
-    // Hybrid Sync Logic: Use high-frequency estimation with 'onboundary' correction
     const wordsInSegment = textSegment.split(/\s+/).filter(w => w.length > 0);
-    const estimatedWPS = (160 / 60) * playbackSpeed; // Estimated words per second
+    const estimatedWPS = (160 / 60) * playbackSpeed;
     const startTime = Date.now();
     let estimatedWordCount = 0;
     boundaryFiredRef.current = false;
 
     syncIntervalRef.current = window.setInterval(() => {
-      // Only estimate if onboundary hasn't fired recently to prevent jumpy movement
+      if (sessionId !== speechSessionIdRef.current) {
+        clearInterval(syncIntervalRef.current!);
+        return;
+      }
       if (!boundaryFiredRef.current) {
         const elapsed = (Date.now() - startTime) / 1000;
         const currentEst = Math.floor(elapsed * estimatedWPS);
         if (currentEst > estimatedWordCount && currentEst < wordsInSegment.length) {
           estimatedWordCount = currentEst;
-          const globalIdx = block.wordStartIndex + relOffset + estimatedWordCount;
-          if (globalIdx > wordIdxRef.current) {
-            setCurrentWordIndex(globalIdx);
-          }
+          setCurrentWordIndex(block.wordStartIndex + relOffset + estimatedWordCount);
         }
       }
-    }, 50);
+    }, 100);
 
     utt.onboundary = (e) => {
+      if (sessionId !== speechSessionIdRef.current) return;
       if (e.name === 'word') {
         boundaryFiredRef.current = true;
         const charTxt = textSegment.substring(0, e.charIndex).trim();
         const wordCount = charTxt ? charTxt.split(/\s+/).length : 0;
         const globalWordIdx = block.wordStartIndex + relOffset + wordCount;
-        if (globalWordIdx > wordIdxRef.current) {
-          wordIdxRef.current = globalWordIdx;
-          setCurrentWordIndex(globalWordIdx);
-        }
+        wordIdxRef.current = globalWordIdx;
+        setCurrentWordIndex(globalWordIdx);
       }
     };
 
-    utt.onend = () => { 
-      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-      onSegmentFinish(); 
-    };
-    utt.onerror = () => { 
-      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-      if (isPlayingRef.current) setTimeout(speak, 500); 
-    };
+    utt.onend = () => { if (sessionId === speechSessionIdRef.current) onSegmentFinish(); };
+    utt.onerror = (e) => { if (sessionId === speechSessionIdRef.current && e.error !== 'interrupted') onSegmentFinish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, saveProgress, useNeuralTTS, speakNeural]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, useNeuralTTS, speakNeural]);
 
   const togglePlayback = () => {
     if (isPlaying) {
-      window.speechSynthesis.cancel();
-      if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} }
-      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
       setIsPlaying(false);
       isPlayingRef.current = false;
+      window.speechSynthesis.cancel();
+      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+      speechSessionIdRef.current++;
     } else {
       setIsPlaying(true);
       isPlayingRef.current = true;
+      speechSessionIdRef.current++;
       speak();
     }
   };
 
   const jumpTo = (idx: number) => {
+    speechSessionIdRef.current++;
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
-    saveProgress(idx);
     if (isPlayingRef.current) { 
       window.speechSynthesis.cancel();
-      if (audioSourceRef.current) { try { audioSourceRef.current.stop(); } catch(e){} }
+      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
       if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-      setTimeout(speak, 150); 
+      setTimeout(() => speak(), 100); 
     }
   };
 
@@ -564,7 +620,7 @@ const App = () => {
     const file = e.target.files?.[0];
     if (!file) return;
     setIsLoading(true);
-    setLoadingStatus("Deconstructing Document...");
+    setLoadingStatus("Deconstructing Book...");
     try {
       const buffer = await file.arrayBuffer();
       const ext = file.name.split('.').pop()?.toLowerCase();
@@ -579,21 +635,20 @@ const App = () => {
       const newBook: Book = {
         id: crypto.randomUUID(),
         title: result.metadata?.title || file.name,
-        author: result.metadata?.creator || 'Unknown Source',
+        author: result.metadata?.creator || 'Unknown',
         displayBlocks: result.displayBlocks,
         chapters: result.chapters,
-        lastPosition: 0,
         type: ext as any || 'txt',
         fileData: ext === 'pdf' ? buffer : undefined
       };
-      await saveBookToDB(newBook);
+      await saveBookContent(newBook);
       setBooks(prev => [...prev, newBook]);
       setActiveBook(newBook);
       wordIdxRef.current = 0;
       setCurrentWordIndex(0);
       setView('reader');
     } catch (err) {
-      setErrorMsg("Failed to process document. File might be encrypted.");
+      setErrorMsg("Error parsing file.");
     } finally {
       setIsLoading(false);
     }
@@ -602,7 +657,7 @@ const App = () => {
   const visibleBlocks = useMemo(() => {
     if (!activeBook) return [];
     const idx = findBlockIdx(currentWordIndex);
-    return activeBook.displayBlocks.slice(Math.max(0, idx - 3), Math.min(activeBook.displayBlocks.length, idx + 8));
+    return activeBook.displayBlocks.slice(Math.max(0, idx - 2), Math.min(activeBook.displayBlocks.length, idx + 6));
   }, [activeBook, currentWordIndex, findBlockIdx]);
 
   const activeThemeClasses = {
@@ -618,7 +673,6 @@ const App = () => {
         <div className="fixed inset-0 z-[200] bg-zinc-950/95 flex flex-col items-center justify-center text-white animate-in fade-in">
           <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-8" />
           <h2 className="text-xl font-black uppercase tracking-widest">{loadingStatus}</h2>
-          <p className="mt-2 text-[10px] opacity-30 uppercase tracking-[0.5em] animate-pulse">Synchronizing Neural Buffer</p>
         </div>
       )}
 
@@ -634,15 +688,20 @@ const App = () => {
 
       <header className={`h-16 flex items-center justify-between px-5 border-b z-50 transition-colors ${activeThemeClasses}`}>
         <div className="flex items-center gap-4">
-          <button onClick={() => { window.speechSynthesis.cancel(); if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){} isPlayingRef.current = false; setView('library'); }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow active:scale-90 transition-transform">
+          <button onClick={() => { 
+            window.speechSynthesis.cancel(); 
+            if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){} 
+            isPlayingRef.current = false; 
+            speechSessionIdRef.current++;
+            setView('library'); 
+          }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow active:scale-90 transition-transform">
             <BookOpen size={18} />
           </button>
           <div className="overflow-hidden">
             <h1 className="text-[10px] font-black opacity-40 uppercase truncate max-w-[90px] tracking-tight">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
             {view === 'reader' && (
               <div className="text-[10px] font-black text-blue-600 truncate max-w-[130px] flex items-center gap-1.5 uppercase animate-in slide-in-from-left duration-300">
-                <Bookmark size={9} className="fill-blue-600" />
-                {readerMode === 'pdf' ? `P.${currentPage}` : (currentChapter?.title || 'STORY')}
+                {readerMode === 'pdf' ? `P.${currentPage}` : (currentChapter?.title || 'INDEXING')}
               </div>
             )}
           </div>
@@ -651,18 +710,13 @@ const App = () => {
         <div className="flex items-center gap-2">
           {view === 'reader' && (
             <>
-              {activeBook?.type === 'pdf' && (
-                <button onClick={() => setReaderMode(p => p === 'pdf' ? 'reflow' : 'pdf')} className={`p-2.5 rounded-xl transition-all ${readerMode === 'pdf' ? 'bg-blue-600 text-white shadow' : 'bg-zinc-500/10'}`}>
-                  {readerMode === 'pdf' ? <Headphones size={18} /> : <FileText size={18} />}
-                </button>
-              )}
               <button onClick={() => setIsSidebarOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10 active:scale-90"><List size={18} /></button>
               <button onClick={() => setIsSettingsOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10 active:scale-90"><Settings size={18} /></button>
             </>
           )}
           {view === 'library' && (
             <label className="p-2.5 bg-blue-600 text-white rounded-xl shadow cursor-pointer flex items-center gap-2 px-4 active:scale-95 transition-all">
-              <Plus size={16} /> <span className="text-[10px] font-black uppercase tracking-widest">Add Book</span>
+              <Plus size={16} /> <span className="text-[10px] font-black uppercase tracking-widest">Import</span>
               <input type="file" className="hidden" accept=".epub,.pdf,.txt" onChange={handleFileUpload} />
             </label>
           )}
@@ -674,13 +728,12 @@ const App = () => {
           <div className="h-full overflow-y-auto p-6 no-scrollbar bg-transparent">
             <div className="max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-2 gap-4 pb-28">
               {books.map(b => (
-                <div key={b.id} onClick={() => { setActiveBook(b); wordIdxRef.current = b.lastPosition || 0; setCurrentWordIndex(b.lastPosition || 0); setView('reader'); }} className={`p-6 rounded-[2.5rem] border-2 cursor-pointer transition-all active:scale-[0.98] ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 shadow-xl' : 'bg-white border-zinc-100 shadow-md'}`}>
+                <div key={b.id} onClick={() => { setActiveBook(b); wordIdxRef.current = 0; setCurrentWordIndex(0); setView('reader'); }} className={`p-6 rounded-[2.5rem] border-2 cursor-pointer transition-all active:scale-[0.98] ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 shadow-xl' : 'bg-white border-zinc-100 shadow-md'}`}>
                    <div className="flex justify-between items-center mb-4">
                      <span className="text-[9px] font-black uppercase text-blue-600 bg-blue-600/10 px-3 py-1 rounded-full">{b.type}</span>
                      <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(prev => prev.filter(x => x.id !== b.id)); }} className="opacity-20 hover:opacity-100 p-2 text-red-500 transition-opacity"><Trash2 size={16}/></button>
                    </div>
                    <h3 className="text-lg font-black leading-tight line-clamp-2 mb-1 tracking-tight">{b.title}</h3>
-                   <p className="text-[9px] uppercase font-bold opacity-30 tracking-[0.2em]">{b.author}</p>
                 </div>
               ))}
             </div>
@@ -688,7 +741,7 @@ const App = () => {
         ) : (
           <div className="h-full flex flex-col">
             {readerMode === 'reflow' ? (
-              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-6 py-12 no-scrollbar scroll-smooth">
+              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-6 py-14 no-scrollbar scroll-smooth">
                 <article className="max-w-xl mx-auto space-y-12 pb-[400px]">
                   {visibleBlocks.map((b, i) => (
                     <WordBlock key={`${b.wordStartIndex}-${i}`} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
@@ -753,16 +806,15 @@ const App = () => {
             </div>
             <div className="flex-1 overflow-y-auto p-4 space-y-1.5 no-scrollbar">
               {activeBook?.chapters.length ? activeBook.chapters.map((c, i) => {
-                const isActive = currentChapter?.startIndex === c.startIndex;
+                const isActive = currentChapter === c;
                 return (
-                  <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-5 rounded-2xl text-[10px] font-bold transition-all ${isActive ? 'bg-blue-600 text-white shadow-xl translate-x-1' : 'opacity-40 bg-zinc-500/5'}`}>
+                  <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-5 rounded-2xl text-[10px] font-bold transition-all ${isActive ? 'bg-blue-600 text-white shadow-xl translate-x-1 border-l-4 border-white' : 'opacity-40 bg-zinc-500/5 hover:opacity-100'}`}>
                     <div className="flex justify-between items-center">
-                      <span className="truncate pr-4 uppercase">{c.title}</span>
-                      {isActive && <ChevronRight size={14} />}
+                      <span className="truncate pr-4 uppercase tracking-tighter">{c.title}</span>
                     </div>
                   </button>
                 );
-              }) : <div className="p-16 text-center opacity-10 text-[9px] font-black uppercase tracking-[0.4em]">Empty Stack</div>}
+              }) : <div className="p-16 text-center opacity-10 text-[9px] font-black uppercase tracking-[0.4em]">Empty</div>}
             </div>
           </div>
         </div>
@@ -773,13 +825,13 @@ const App = () => {
           <div className="absolute inset-0 bg-black/40" onClick={() => setIsSettingsOpen(false)} />
           <div className={`relative w-full rounded-t-[3.5rem] p-10 pb-12 border-t animate-in slide-in-from-bottom duration-300 ${activeThemeClasses}`}>
              <div className="flex justify-between items-center mb-10">
-               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Config</h2>
+               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Engine</h2>
                <button onClick={() => setIsSettingsOpen(false)} className="p-3 bg-zinc-500/10 rounded-full"><X size={20} /></button>
              </div>
              <div className="space-y-10">
                 <div>
                    <div className="flex justify-between items-center mb-5">
-                     <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Core Architecture</span>
+                     <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Neural Core</span>
                      <button onClick={() => setUseNeuralTTS(!useNeuralTTS)} className={`px-4 py-2 rounded-full text-[9px] font-black uppercase flex items-center gap-2 transition-all ${useNeuralTTS ? 'bg-blue-600 text-white shadow-lg' : 'bg-zinc-500/10 opacity-40'}`}>
                         {useNeuralTTS ? <Zap size={12} fill="white" /> : <Cpu size={12} />} {useNeuralTTS ? 'Neural Mode' : 'System Mode'}
                      </button>
@@ -794,21 +846,6 @@ const App = () => {
                   <div className="flex justify-between items-center mb-4"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Flow Velocity</span> <span className="text-xs font-black text-blue-600">{playbackSpeed}x</span></div>
                   <input type="range" min="0.5" max="2.5" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-1.5 bg-blue-600/10 rounded-full appearance-none accent-blue-600" />
                 </div>
-                {!useNeuralTTS && (
-                  <div>
-                    <span className="text-[10px] font-black opacity-30 uppercase block mb-5 tracking-[0.3em]">System Identity</span>
-                    <div className="max-h-36 overflow-y-auto space-y-2 no-scrollbar pr-1 custom-scrollbar">
-                      {availableVoices.map(v => (
-                        <button key={v.voiceURI} onClick={() => setSelectedVoiceURI(v.voiceURI)} className={`w-full text-left p-4 rounded-2xl text-[10px] font-bold truncate transition-all ${selectedVoiceURI === v.voiceURI ? 'bg-blue-600/10 text-blue-600 border border-blue-600/20' : 'bg-zinc-500/5 opacity-40'}`}>
-                           <div className="flex items-center gap-3">
-                             <Volume2 size={12} className={selectedVoiceURI === v.voiceURI ? 'text-blue-600' : 'opacity-20'} />
-                             {v.name}
-                           </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
              </div>
           </div>
         </div>
