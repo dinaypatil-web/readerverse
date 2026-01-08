@@ -37,7 +37,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V32_STABLE';
+const DB_NAME = 'ReaderVerse_V33_STABLE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -509,15 +509,26 @@ const App = () => {
   }, [activeBook, currentWordIndex]);
 
   const findBlockIdx = useCallback((wIdx: number) => {
-    if (!activeBook) return 0;
-    let low = 0, high = activeBook.displayBlocks.length - 1;
+    if (!activeBook || activeBook.displayBlocks.length === 0) return 0;
+    const blocks = activeBook.displayBlocks;
+    
+    let low = 0, high = blocks.length - 1;
     while (low <= high) {
       const mid = (low + high) >>> 1;
-      const b = activeBook.displayBlocks[mid];
-      if (wIdx >= b.wordStartIndex && wIdx < b.wordStartIndex + b.wordCount) return mid;
-      if (wIdx < b.wordStartIndex) high = mid - 1; else low = mid + 1;
+      const b = blocks[mid];
+      // Check if word index is inside this block
+      if (wIdx >= b.wordStartIndex && wIdx < (b.wordStartIndex + b.wordCount)) {
+        return mid;
+      }
+      if (wIdx < b.wordStartIndex) {
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
     }
-    return 0;
+    // If not found inside a block, return the 'low' index clipped to valid range
+    // This handles boundary cases where the index points to the start of a new block.
+    return Math.max(0, Math.min(blocks.length - 1, low));
   }, [activeBook]);
 
   const speakNeural = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
@@ -578,8 +589,26 @@ const App = () => {
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
     
-    const relOffset = sIdx - block.wordStartIndex;
-    const textSegment = block.words.slice(relOffset).join(" ");
+    const relOffset = Math.max(0, sIdx - block.wordStartIndex);
+    // If we're at the very end of a block, move to the next one
+    if (relOffset >= block.wordCount && bIdx < activeBook.displayBlocks.length - 1) {
+        wordIdxRef.current = activeBook.displayBlocks[bIdx + 1].wordStartIndex;
+        setCurrentWordIndex(wordIdxRef.current);
+        speak();
+        return;
+    }
+
+    const textSegment = block.words.slice(relOffset).join(" ").trim();
+    if (!textSegment) {
+        // Skip empty segments immediately
+        const nextWord = block.wordStartIndex + block.wordCount;
+        if (nextWord < totalWords) {
+            wordIdxRef.current = nextWord;
+            setCurrentWordIndex(nextWord);
+            speak();
+        }
+        return;
+    }
     
     const onSegmentFinish = () => {
       if (sessionId !== speechSessionIdRef.current) return;
@@ -587,7 +616,7 @@ const App = () => {
       if (nextWord < totalWords && isPlayingRef.current) {
         wordIdxRef.current = nextWord;
         setCurrentWordIndex(nextWord);
-        saveProgress(); // Periodic save
+        saveProgress();
         setTimeout(() => speak(), 50);
       } else {
         setIsPlaying(false);
@@ -680,15 +709,17 @@ const App = () => {
 
   const jumpTo = (idx: number) => {
     initAudioContext();
-    warmUpSpeech();
+    window.speechSynthesis.cancel();
+    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+    if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
+    
     speechSessionIdRef.current++;
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
     saveProgress();
+    
+    // Tiny timeout to ensure the browser has actually cleared the speech synthesis buffer
     if (isPlayingRef.current) { 
-      window.speechSynthesis.cancel();
-      if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-      if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
       setTimeout(() => speak(), 100); 
     }
   };
