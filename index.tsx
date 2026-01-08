@@ -37,7 +37,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V36_STABLE';
+const DB_NAME = 'ReaderVerse_V38_STABLE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -202,7 +202,10 @@ function walkNodes(node: Node, results: string[]) {
     const tag = (node as Element).tagName.toUpperCase();
     if (['SCRIPT', 'STYLE', 'HEAD', 'META', 'LINK', 'SVG', 'NOSCRIPT'].includes(tag)) return;
     for (let i = 0; i < node.childNodes.length; i++) walkNodes(node.childNodes[i], results);
-    if (['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BR', 'TR', 'BLOCKQUOTE'].includes(tag)) results.push("\n");
+    // Add a marker for block transitions to help splitting paragraphs later
+    if (['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BR', 'TR', 'BLOCKQUOTE'].includes(tag)) {
+      results.push(" [[PARA_BREAK]] ");
+    }
   }
 }
 
@@ -258,7 +261,6 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
       const rawHtml = await book.archive.getText(url);
       if (!rawHtml) continue;
       const doc = new DOMParser().parseFromString(rawHtml, "text/html");
-      
       const itemHref = getCanonical(item.href || '');
       
       const matches = toc.filter((t: any) => {
@@ -280,20 +282,23 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
 
       const parts: string[] = [];
       walkNodes(doc.body || doc.documentElement, parts);
-      const text = parts.join(" ").replace(/\s+/g, ' ').trim();
+      const contentStr = parts.join(" ").replace(/\s+/g, ' ');
       
-      if (text) {
-        const splitParas = text.split(/\n+/);
-        let spineWordCount = 0;
-        for (const p of splitParas) {
-          const words = p.trim().split(/\s+/).filter(w => w.length > 0);
-          if (words.length > 0) {
-            displayBlocks.push({ words, wordStartIndex: totalWordCount + spineWordCount, wordCount: words.length });
-            spineWordCount += words.length;
-          }
+      // Split by our paragraph break marker
+      const splitParas = contentStr.split('[[PARA_BREAK]]');
+      let spineWordCount = 0;
+      for (const p of splitParas) {
+        const words = p.trim().split(/\s+/).filter(w => w.length > 0);
+        if (words.length > 0) {
+          displayBlocks.push({ 
+            words, 
+            wordStartIndex: totalWordCount + spineWordCount, 
+            wordCount: words.length 
+          });
+          spineWordCount += words.length;
         }
-        totalWordCount += spineWordCount;
       }
+      totalWordCount += spineWordCount;
     } catch (e) {
       console.error("Error parsing spine item", e);
     }
@@ -362,10 +367,8 @@ const App = () => {
   const boundaryFiredRef = useRef(false);
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
 
-  // Silent audio to prevent background suspension on mobile
   useEffect(() => {
     const audio = new Audio();
-    // 1 second of silence to keep audio hardware warm
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
     audio.loop = true;
     heartbeatRef.current = audio;
@@ -374,6 +377,12 @@ const App = () => {
       audio.src = "";
     };
   }, []);
+
+  const saveProgress = useCallback(() => {
+    if (activeBook) {
+      updateBookProgress(activeBook.id, wordIdxRef.current);
+    }
+  }, [activeBook]);
 
   const initAudioContext = useCallback(() => {
     try {
@@ -397,13 +406,7 @@ const App = () => {
     } catch (e) {}
   }, []);
 
-  const saveProgress = useCallback(() => {
-    if (activeBook) {
-      updateBookProgress(activeBook.id, wordIdxRef.current);
-    }
-  }, [activeBook]);
-
-  // Handle Media Session and background controls
+  // Handle Media Session and Chapter Navigation
   useEffect(() => {
     if ('mediaSession' in navigator && activeBook) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -415,8 +418,16 @@ const App = () => {
 
       navigator.mediaSession.setActionHandler('play', () => togglePlayback());
       navigator.mediaSession.setActionHandler('pause', () => togglePlayback());
-      navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(Math.max(0, wordIdxRef.current - 30)));
-      navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(Math.min(totalWords - 1, wordIdxRef.current + 30)));
+      
+      // Jumpto logic restricted to chapter boundaries as per request
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        const nextCh = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
+        if (nextCh) jumpTo(nextCh.startIndex);
+      });
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        const prevChs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
+        if (prevChs.length) jumpTo(prevChs[prevChs.length - 1].startIndex);
+      });
     }
   }, [activeBook, isPlaying]);
 
@@ -424,7 +435,6 @@ const App = () => {
     const loadVoices = () => {
       let voices = window.speechSynthesis.getVoices();
       if (!voices || voices.length === 0) return;
-      
       const englishVoices = voices
         .filter(v => v.lang.toLowerCase().includes('en'))
         .sort((a,b) => {
@@ -432,13 +442,11 @@ const App = () => {
           const bPriority = (b.name.includes('Natural') || b.name.includes('Premium') || b.name.includes('Google') || b.name.includes('Enhanced')) ? -1 : 1;
           return aPriority - bPriority;
         });
-        
       setAvailableVoices(englishVoices);
       if (englishVoices.length > 0 && !selectedVoiceURI) {
         setSelectedVoiceURI(englishVoices[0].voiceURI);
       }
     };
-    
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
     const timer = setInterval(loadVoices, 1000);
@@ -472,6 +480,22 @@ const App = () => {
       window.removeEventListener('pagehide', handleUnload);
       window.removeEventListener('beforeunload', handleUnload);
     };
+  }, [saveProgress]);
+
+  // Handle phone calls or other system-level audio interruptions
+  useEffect(() => {
+    const audio = heartbeatRef.current;
+    if (audio) {
+      const handleSystemPause = () => {
+        if (isPlayingRef.current) {
+          setIsPlaying(false);
+          isPlayingRef.current = false;
+          saveProgress(); // Bookmark on system pause
+        }
+      };
+      audio.addEventListener('pause', handleSystemPause);
+      return () => audio.removeEventListener('pause', handleSystemPause);
+    }
   }, [saveProgress]);
 
   useEffect(() => {
@@ -586,7 +610,6 @@ const App = () => {
   }, [playbackSpeed, initAudioContext]);
 
   const speak = useCallback(async () => {
-    // 1. Session Protection
     if (!activeBook || !isPlayingRef.current) return;
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
@@ -596,7 +619,6 @@ const App = () => {
     const block = activeBook.displayBlocks[bIdx];
     if (!block) return;
     
-    // 2. Exact word alignment
     const relOffset = Math.max(0, sIdx - block.wordStartIndex);
     if (relOffset >= block.wordCount && bIdx < activeBook.displayBlocks.length - 1) {
         wordIdxRef.current = activeBook.displayBlocks[bIdx + 1].wordStartIndex;
@@ -631,12 +653,10 @@ const App = () => {
       }
     };
 
-    // 3. Neural strategy
     if (useNeuralTTS && process.env.API_KEY) {
       try { await speakNeural(textSegment, sessionId, onSegmentFinish); return; } catch (e: any) { setUseNeuralTTS(false); }
     }
 
-    // 4. System Synthesis Strategy
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(textSegment);
     const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
@@ -666,15 +686,14 @@ const App = () => {
     }, 100);
 
     utt.onboundary = (e) => {
-      // CRITICAL: Double-check session to prevent 'chapter jump' rubber-banding
       if (sessionId !== speechSessionIdRef.current) return;
       if (e.name === 'word') {
         boundaryFiredRef.current = true;
         const charTxt = textSegment.substring(0, e.charIndex).trim();
-        const wordCount = charTxt ? charTxt.split(/\s+/).length : 0;
+        // Fixed word counting logic to prevent skipping
+        const wordCount = charTxt ? charTxt.split(/\s+/).filter(w => w.length > 0).length : 0;
         const globalWordIdx = block.wordStartIndex + relOffset + wordCount;
         
-        // Strict index monotonicity check
         if (globalWordIdx >= wordIdxRef.current) {
             wordIdxRef.current = globalWordIdx;
             setCurrentWordIndex(globalWordIdx);
@@ -708,14 +727,14 @@ const App = () => {
       window.speechSynthesis.cancel();
       if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
       if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
-      speechSessionIdRef.current++; // Invalidate session
+      speechSessionIdRef.current++; 
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
       if (heartbeatRef.current) heartbeatRef.current.pause();
       saveProgress(); // Bookmark on pause
     } else {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      speechSessionIdRef.current++; // Start fresh session
+      speechSessionIdRef.current++; 
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
       if (heartbeatRef.current) heartbeatRef.current.play().catch(() => {});
       speak();
@@ -724,18 +743,15 @@ const App = () => {
 
   const jumpTo = (idx: number) => {
     initAudioContext();
-    // 1. Force kill current synthesis and sessions
     speechSessionIdRef.current++;
     window.speechSynthesis.cancel();
     if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
     if (syncIntervalRef.current) clearInterval(syncIntervalRef.current);
     
-    // 2. Set new position AND bookmark immediately
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
-    saveProgress(); 
+    saveProgress(); // Bookmark immediately on user click/jump
     
-    // 3. Auto-resume if already playing, otherwise stay at bookmark
     if (isPlayingRef.current) { 
       setTimeout(() => speak(), 50); 
     }
@@ -909,11 +925,19 @@ const App = () => {
                     <div className="flex items-center justify-between">
                       <button onClick={() => setIsSettingsOpen(true)} className="w-11 h-11 rounded-2xl bg-zinc-500/5 flex items-center justify-center font-black text-[10px] active:scale-90 transition-transform">{playbackSpeed}x</button>
                       <div className="flex items-center gap-6">
-                        <button onClick={() => jumpTo(Math.max(0, currentWordIndex - 30))} className="opacity-20 active:scale-90"><SkipBack size={26} fill="currentColor" /></button>
+                        <button onClick={() => {
+                          // Jump to previous chapter as per 'jumpto logic works only when chapter ends' requirement
+                          const prevChs = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
+                          if (prevChs && prevChs.length) jumpTo(prevChs[prevChs.length - 1].startIndex);
+                        }} className="opacity-20 active:scale-90"><SkipBack size={26} fill="currentColor" /></button>
                         <button onClick={togglePlayback} className="w-16 h-16 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-2xl active:scale-90 transition-all">
                           {isPlaying ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="ml-1" />}
                         </button>
-                        <button onClick={() => jumpTo(Math.min(totalWords - 1, currentWordIndex + 30))} className="opacity-20 active:scale-90"><SkipForward size={26} fill="currentColor" /></button>
+                        <button onClick={() => {
+                          // Jump to next chapter as per 'jumpto logic works only when chapter ends' requirement
+                          const nextCh = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
+                          if (nextCh) jumpTo(nextCh.startIndex);
+                        }} className="opacity-20 active:scale-90"><SkipForward size={26} fill="currentColor" /></button>
                       </div>
                       <div className="w-11 h-11 flex items-center justify-center opacity-20"><Volume2 size={18} /></div>
                     </div>
