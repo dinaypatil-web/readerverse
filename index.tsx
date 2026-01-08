@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { 
   Play, Pause, SkipForward, SkipBack, Settings, X, Check, 
   List, Loader2, BookOpen, Trash2, Plus, Clock, Info, AlertCircle, 
-  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2
+  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2, Globe
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -36,7 +36,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V30_STABLE';
+const DB_NAME = 'ReaderVerse_V31_STABLE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -196,7 +196,6 @@ function walkNodes(node: Node, results: string[]) {
  */
 function getWordOffsetOfId(doc: Document, id: string): number {
   if (!id) return 0;
-  // Handle case-insensitivity and name attributes which are common in older EPUBs
   const target = doc.getElementById(id) || 
                  doc.querySelector(`[name="${id}"]`) || 
                  doc.querySelector(`[id="${id.toLowerCase()}"]`) ||
@@ -250,7 +249,6 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
       
       const itemHref = getCanonical(item.href || '');
       
-      // Collect all TOC entries associated with this file
       const matches = toc.filter((t: any) => {
         const tHref = getCanonical(t.href || '');
         return itemHref === tHref || itemHref.endsWith(tHref) || tHref.endsWith(itemHref);
@@ -262,14 +260,12 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
         const title = match.label?.trim() || `Chapter ${chapters.length + 1}`;
         const startIndex = totalWordCount + offset;
         
-        // Ensure strictly increasing indices or update existing title if at same position
         const lastCh = chapters[chapters.length - 1];
         if (!lastCh || lastCh.startIndex !== startIndex) {
           chapters.push({ title, startIndex });
         }
       }
 
-      // Extract text content
       const parts: string[] = [];
       walkNodes(doc.body || doc.documentElement, parts);
       const text = parts.join(" ").replace(/\s+/g, ' ').trim();
@@ -292,7 +288,6 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
     if (i % 5 === 0) { onStatus(`Parsing ${i+1}/${spineItems.length}...`); await new Promise(r => setTimeout(r, 0)); }
   }
 
-  // Final validation
   const validatedChapters = chapters.sort((a, b) => a.startIndex - b.startIndex);
   return { displayBlocks, chapters: validatedChapters, metadata };
 }
@@ -354,21 +349,58 @@ const App = () => {
   const speechSessionIdRef = useRef(0);
   const boundaryFiredRef = useRef(false);
 
+  const initAudioContext = useCallback(() => {
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
+      if (audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume();
+      }
+    } catch (e) {
+      console.error("AudioContext init failed", e);
+    }
+  }, []);
+
+  const warmUpSpeech = useCallback(() => {
+    try {
+      window.speechSynthesis.cancel();
+      const warmUp = new SpeechSynthesisUtterance("");
+      warmUp.volume = 0;
+      window.speechSynthesis.speak(warmUp);
+    } catch (e) {}
+  }, []);
+
   useEffect(() => {
     const loadVoices = () => {
-      const voices = window.speechSynthesis.getVoices();
-      if (!voices.length) return;
-      const sorted = voices.filter(v => v.lang.startsWith('en')).sort((a,b) => (a.name.includes('Natural') || a.name.includes('Premium') || a.name.includes('Google')) ? -1 : 1);
-      setAvailableVoices(sorted);
-      if (sorted.length && !selectedVoiceURI) {
-        const best = sorted.find(v => v.name.includes('Natural') || v.name.includes('Google')) || sorted[0];
-        setSelectedVoiceURI(best.voiceURI);
+      let voices = window.speechSynthesis.getVoices();
+      if (!voices || voices.length === 0) return;
+      
+      const englishVoices = voices
+        .filter(v => v.lang.toLowerCase().includes('en'))
+        .sort((a,b) => {
+          const aPriority = (a.name.includes('Natural') || a.name.includes('Premium') || a.name.includes('Google') || a.name.includes('Enhanced')) ? -1 : 1;
+          const bPriority = (b.name.includes('Natural') || b.name.includes('Premium') || b.name.includes('Google') || b.name.includes('Enhanced')) ? -1 : 1;
+          return aPriority - bPriority;
+        });
+        
+      setAvailableVoices(englishVoices);
+      
+      // Default selection if none exists
+      if (englishVoices.length > 0 && !selectedVoiceURI) {
+        setSelectedVoiceURI(englishVoices[0].voiceURI);
       }
     };
+    
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
-    const interval = setInterval(loadVoices, 3000);
-    return () => { window.speechSynthesis.onvoiceschanged = null; clearInterval(interval); };
+    
+    // Interval to ensure voices are loaded on slow desktop browsers
+    const timer = setInterval(loadVoices, 1000);
+    return () => { 
+      window.speechSynthesis.onvoiceschanged = null; 
+      clearInterval(timer);
+    };
   }, [selectedVoiceURI]);
 
   useEffect(() => {
@@ -440,9 +472,6 @@ const App = () => {
     let ch = activeBook.chapters[0];
     let low = 0;
     let high = activeBook.chapters.length - 1;
-    
-    // Find the first chapter that satisfies startIndex <= currentWordIndex
-    // If multiple have the same index, we want the most recent one for that specific location
     while (low <= high) {
       const mid = Math.floor((low + high) / 2);
       if (activeBook.chapters[mid].startIndex <= currentWordIndex) {
@@ -482,8 +511,9 @@ const App = () => {
       if (sessionId !== speechSessionIdRef.current) return;
       const b64 = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       if (!b64) throw new Error("Audio failed");
-      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      const ctx = audioCtxRef.current;
+      
+      initAudioContext();
+      const ctx = audioCtxRef.current!;
       const buffer = await decodeAudioData(decodeBase64(b64), ctx);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
@@ -512,7 +542,7 @@ const App = () => {
       };
       src.start();
     } catch (e: any) { throw e; }
-  }, [playbackSpeed]);
+  }, [playbackSpeed, initAudioContext]);
 
   const speak = useCallback(async () => {
     if (!activeBook || !isPlayingRef.current) return;
@@ -546,9 +576,10 @@ const App = () => {
 
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(textSegment);
-    const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI);
+    const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
     if (v) utt.voice = v;
     utt.rate = playbackSpeed;
+    utt.volume = 1;
     
     const wordsInSegment = textSegment.split(/\s+/).filter(w => w.length > 0);
     const estimatedWPS = (160 / 60) * playbackSpeed;
@@ -583,12 +614,24 @@ const App = () => {
       }
     };
 
+    utt.onstart = () => {
+      if (sessionId !== speechSessionIdRef.current) {
+        window.speechSynthesis.cancel();
+      }
+    };
+
     utt.onend = () => { if (sessionId === speechSessionIdRef.current) onSegmentFinish(); };
-    utt.onerror = (e) => { if (sessionId === speechSessionIdRef.current && e.error !== 'interrupted') onSegmentFinish(); };
+    utt.onerror = (e) => { 
+      if (sessionId === speechSessionIdRef.current && e.error !== 'interrupted') {
+        onSegmentFinish();
+      }
+    };
     window.speechSynthesis.speak(utt);
   }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, useNeuralTTS, speakNeural]);
 
   const togglePlayback = () => {
+    initAudioContext();
+    warmUpSpeech();
     if (isPlaying) {
       setIsPlaying(false);
       isPlayingRef.current = false;
@@ -605,6 +648,8 @@ const App = () => {
   };
 
   const jumpTo = (idx: number) => {
+    initAudioContext();
+    warmUpSpeech();
     speechSessionIdRef.current++;
     wordIdxRef.current = idx;
     setCurrentWordIndex(idx);
@@ -823,16 +868,53 @@ const App = () => {
       {isSettingsOpen && (
         <div className="fixed inset-0 z-[110] flex items-end animate-in fade-in duration-300">
           <div className="absolute inset-0 bg-black/40" onClick={() => setIsSettingsOpen(false)} />
-          <div className={`relative w-full rounded-t-[3.5rem] p-10 pb-12 border-t animate-in slide-in-from-bottom duration-300 ${activeThemeClasses}`}>
-             <div className="flex justify-between items-center mb-10">
-               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Engine</h2>
+          <div className={`relative w-full rounded-t-[3.5rem] p-8 pb-12 border-t animate-in slide-in-from-bottom duration-300 overflow-y-auto max-h-[90vh] no-scrollbar ${activeThemeClasses}`}>
+             <div className="flex justify-between items-center mb-8">
+               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Engine Settings</h2>
                <button onClick={() => setIsSettingsOpen(false)} className="p-3 bg-zinc-500/10 rounded-full"><X size={20} /></button>
              </div>
+             
              <div className="space-y-10">
-                <div>
-                   <div className="flex justify-between items-center mb-5">
+                {/* Voice Selector Section */}
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Voice Profile</span>
+                    <Globe size={14} className="opacity-30" />
+                  </div>
+                  <div className={`relative group ${useNeuralTTS ? 'opacity-20 pointer-events-none' : ''}`}>
+                    <select 
+                      value={selectedVoiceURI} 
+                      onChange={(e) => {
+                        setSelectedVoiceURI(e.target.value);
+                        initAudioContext();
+                        warmUpSpeech();
+                      }}
+                      className={`w-full p-4 pr-10 rounded-2xl text-xs font-bold appearance-none bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none transition-all truncate`}
+                    >
+                      {availableVoices.length > 0 ? (
+                        availableVoices.map(v => (
+                          <option key={v.voiceURI} value={v.voiceURI}>
+                            {v.name.replace(/(Microsoft |Google |Natural )/g, '')} ({v.lang})
+                          </option>
+                        ))
+                      ) : (
+                        <option>No Voices Detected</option>
+                      )}
+                    </select>
+                    <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none opacity-40">
+                      <ChevronRight size={14} className="rotate-90" />
+                    </div>
+                  </div>
+                  {!availableVoices.length && !useNeuralTTS && (
+                    <p className="text-[9px] text-red-500 font-bold uppercase tracking-widest text-center animate-pulse">Waiting for system engine...</p>
+                  )}
+                </div>
+
+                {/* Neural Toggle Section */}
+                <div className="space-y-4">
+                   <div className="flex justify-between items-center">
                      <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Neural Core</span>
-                     <button onClick={() => setUseNeuralTTS(!useNeuralTTS)} className={`px-4 py-2 rounded-full text-[9px] font-black uppercase flex items-center gap-2 transition-all ${useNeuralTTS ? 'bg-blue-600 text-white shadow-lg' : 'bg-zinc-500/10 opacity-40'}`}>
+                     <button onClick={() => { setUseNeuralTTS(!useNeuralTTS); initAudioContext(); warmUpSpeech(); }} className={`px-4 py-2 rounded-full text-[9px] font-black uppercase flex items-center gap-2 transition-all ${useNeuralTTS ? 'bg-blue-600 text-white shadow-lg' : 'bg-zinc-500/10 opacity-40'}`}>
                         {useNeuralTTS ? <Zap size={12} fill="white" /> : <Cpu size={12} />} {useNeuralTTS ? 'Neural Mode' : 'System Mode'}
                      </button>
                    </div>
@@ -842,8 +924,13 @@ const App = () => {
                       ))}
                    </div>
                 </div>
+
+                {/* Speed Slider */}
                 <div>
-                  <div className="flex justify-between items-center mb-4"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Flow Velocity</span> <span className="text-xs font-black text-blue-600">{playbackSpeed}x</span></div>
+                  <div className="flex justify-between items-center mb-4">
+                    <span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Flow Velocity</span> 
+                    <span className="text-xs font-black text-blue-600">{playbackSpeed}x</span>
+                  </div>
                   <input type="range" min="0.5" max="2.5" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-1.5 bg-blue-600/10 rounded-full appearance-none accent-blue-600" />
                 </div>
              </div>
