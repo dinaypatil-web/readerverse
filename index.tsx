@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { 
   Play, Pause, SkipForward, SkipBack, Settings, X, Check, 
   List, Loader2, BookOpen, Trash2, Plus, Clock, Info, AlertCircle, 
-  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2, Globe
+  Zap, ZoomIn, ZoomOut, Maximize2, FileText, Headphones, Bookmark, Cpu, ChevronRight, Volume2, Globe,
+  Shield, Sparkles, Mic2, Layers, Search, MoreHorizontal, Layout
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -13,6 +14,8 @@ import { GoogleGenAI, Modality } from "@google/genai";
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.mjs`;
 
 // --- Types ---
+type TtsProvider = 'system' | 'gemini' | 'google-cloud' | 'minimax';
+
 interface ChapterEntry {
   title: string;
   startIndex: number;
@@ -37,7 +40,7 @@ interface Book {
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V42_STABLE';
+const DB_NAME = 'ReaderVerse_V44_LUXE';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -121,7 +124,7 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
   activeWordRef: React.RefObject<HTMLSpanElement | null>
 }) => {
   return (
-    <p className="font-serif leading-relaxed text-left will-change-transform mb-8" style={{ fontSize: `${fontSize}px` }}>
+    <div className="reader-text leading-[1.8] text-left mb-12" style={{ fontSize: `${fontSize}px` }}>
       {block.words.map((word, wIdx) => {
         const globalIdx = block.wordStartIndex + wIdx;
         const isCurrent = currentWordIndex === globalIdx;
@@ -130,13 +133,17 @@ const WordBlock = memo(({ block, currentWordIndex, onWordClick, fontSize, active
             key={wIdx} 
             ref={isCurrent ? activeWordRef : null}
             onClick={() => onWordClick(globalIdx)}
-            className={`relative inline-block mr-[0.22em] px-1.5 py-0.5 rounded-lg transition-all duration-75 cursor-pointer select-none touch-manipulation ${isCurrent ? 'bg-blue-600 text-white font-bold shadow-xl scale-110 z-20' : 'opacity-60 hover:opacity-100'}`}
+            className={`word-highlight relative inline-block mr-[0.28em] px-1.5 py-0.5 rounded-lg cursor-pointer select-none touch-manipulation ${
+              isCurrent 
+                ? 'bg-blue-600/10 text-blue-600 dark:text-blue-400 font-bold scale-110 z-20 shadow-[0_0_20px_rgba(37,99,235,0.15)] ring-1 ring-blue-600/20' 
+                : 'opacity-70 hover:opacity-100 dark:text-zinc-300'
+            }`}
           >
             {word}
           </span>
         );
       })}
-    </p>
+    </div>
   );
 }, (prev, next) => {
   const prevIsVisible = prev.currentWordIndex >= prev.block.wordStartIndex && prev.currentWordIndex < prev.block.wordStartIndex + prev.block.wordCount;
@@ -163,7 +170,7 @@ const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDoc
       if (!canvasRef.current) return;
       try {
         const page = await pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale });
+        const viewport = page.getViewport({ scale: scale * 1.5 }); // High-DPI
         const canvas = canvasRef.current;
         const context = canvas.getContext('2d', { alpha: false });
         if (!context) return;
@@ -179,14 +186,14 @@ const PDFPage = memo(({ pdf, pageNum, scale, onVisible }: { pdf: pdfjsLib.PDFDoc
   }, [pdf, pageNum, scale]);
 
   return (
-    <div ref={containerRef} className="relative mb-6 shadow-lg mx-auto bg-white dark:bg-zinc-800 rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-700">
+    <div ref={containerRef} className="relative mb-12 shadow-2xl mx-auto bg-white dark:bg-zinc-800 rounded-3xl overflow-hidden border-4 border-white dark:border-zinc-700">
       <canvas ref={canvasRef} className="block mx-auto max-w-full h-auto" />
-      <div className="py-2 text-[8px] font-bold opacity-30 text-center bg-zinc-50 dark:bg-zinc-900/50 uppercase tracking-widest">P.{pageNum}</div>
+      <div className="absolute top-4 right-4 bg-white/50 backdrop-blur-md px-3 py-1 rounded-full text-[10px] font-black opacity-40 uppercase tracking-widest border border-white/20">P.{pageNum}</div>
     </div>
   );
 });
 
-// --- Logic ---
+// --- Parsing ---
 
 function walkNodes(node: Node, results: string[]) {
   if (node.nodeType === Node.TEXT_NODE) {
@@ -204,7 +211,7 @@ function walkNodes(node: Node, results: string[]) {
 
 async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
   const book = e(buffer);
-  onStatus("Opening EPUB...");
+  onStatus("Inhaling Manuscript...");
   await book.opened;
   const metadata = await (book as any).loaded.metadata;
   const navigation = await (book as any).loaded.navigation;
@@ -257,13 +264,13 @@ async function extractEpub(buffer: ArrayBuffer, onStatus: (s: string) => void): 
     } catch (e) {
       console.error("Spine error", e);
     }
-    if (i % 5 === 0) onStatus(`Processing ${i+1}/${spineItems.length}...`);
+    if (i % 5 === 0) onStatus(`Processing Narrative... ${Math.round((i/spineItems.length)*100)}%`);
   }
   return { displayBlocks, chapters: chapters.sort((a,b) => a.startIndex - b.startIndex), metadata };
 }
 
 async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): Promise<{ displayBlocks: TextBlock[]; chapters: ChapterEntry[]; metadata: any }> {
-  onStatus("Rendering PDF Layout...");
+  onStatus("Mapping PDF Layers...");
   const pdf = await pdfjsLib.getDocument({ data: buffer, useSystemFonts: true }).promise;
   const displayBlocks: TextBlock[] = [];
   const chapters: ChapterEntry[] = [];
@@ -279,6 +286,7 @@ async function extractPdf(buffer: ArrayBuffer, onStatus: (s: string) => void): P
       totalWords += words.length;
     }
     page.cleanup();
+    if (i % 10 === 0) onStatus(`Layering Page ${i}/${pdf.numPages}...`);
   }
   return { displayBlocks, chapters, metadata: await pdf.getMetadata() };
 }
@@ -304,7 +312,7 @@ const App = () => {
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>("");
-  const [useNeuralTTS, setUseNeuralTTS] = useState(false);
+  const [ttsProvider, setTtsProvider] = useState<TtsProvider>('system');
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeWordRef = useRef<HTMLSpanElement | null>(null);
@@ -320,7 +328,6 @@ const App = () => {
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
   const wakeLockRef = useRef<any>(null);
 
-  // Silent audio anchor for background persistence
   useEffect(() => {
     const audio = new Audio();
     audio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA== ";
@@ -373,49 +380,39 @@ const App = () => {
     return [...activeBook.chapters].reverse().find(c => c.startIndex <= currentWordIndex) || activeBook.chapters[0];
   }, [activeBook, currentWordIndex]);
 
-  // Handle System Media Controls (Background Persistence)
   useEffect(() => {
     if ('mediaSession' in navigator && activeBook) {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: activeBook.title,
         artist: activeBook.author,
         album: currentChapter?.title || 'ReaderVerse',
-        artwork: [
-          { src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' }
-        ]
+        artwork: [{ src: 'https://cdn-icons-png.flaticon.com/512/3389/3389081.png', sizes: '512x512', type: 'image/png' }]
       });
-
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
-
       navigator.mediaSession.setActionHandler('play', () => togglePlayback());
       navigator.mediaSession.setActionHandler('pause', () => togglePlayback());
-      
       navigator.mediaSession.setActionHandler('nexttrack', () => {
-        const nextCh = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
-        if (nextCh) jumpTo(nextCh.startIndex);
+        const next = activeBook.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
+        if (next) jumpTo(next.startIndex);
       });
       navigator.mediaSession.setActionHandler('previoustrack', () => {
-        const prevChs = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
-        if (prevChs.length) jumpTo(prevChs[prevChs.length - 1].startIndex);
+        const prev = activeBook.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
+        if (prev.length) jumpTo(prev[prev.length - 1].startIndex);
       });
     }
   }, [activeBook, isPlaying, currentChapter]);
 
   useEffect(() => {
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible' && isPlaying) {
-        acquireWakeLock();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
+    const handleVis = () => { if (document.visibilityState === 'visible' && isPlaying) acquireWakeLock(); };
+    document.addEventListener('visibilitychange', handleVis);
+    return () => document.removeEventListener('visibilitychange', handleVis);
   }, [isPlaying, acquireWakeLock]);
 
   useEffect(() => {
     const loadVoices = () => {
       let voices = window.speechSynthesis.getVoices();
       if (!voices.length) return;
-      const filtered = voices.filter(v => v.lang.toLowerCase().includes('en')).sort((a,b) => a.name.includes('Natural') ? -1 : 1);
+      const filtered = voices.filter(v => v.lang.toLowerCase().includes('en')).sort((a,b) => (a.name.includes('Online') || a.name.includes('Natural')) ? -1 : 1);
       setAvailableVoices(filtered);
       if (filtered.length && !selectedVoiceURI) setSelectedVoiceURI(filtered[0].voiceURI);
     };
@@ -429,7 +426,7 @@ const App = () => {
     getBooks().then(stored => {
       setBooks(stored);
       if (!stored.length) {
-        setBooks([{ id: 'demo', title: 'ReaderVerse Pro', author: 'ElevenReaders Studio', displayBlocks: [{ words: "Neural-grade flow enabled. Tap any word to jump. Reading is now effortless.".split(" "), wordStartIndex: 0, wordCount: 12 }], chapters: [{ title: 'Intro', startIndex: 0 }], type: 'demo' }]);
+        setBooks([{ id: 'demo', title: 'The Future of Reading', author: 'ReaderVerse AI', displayBlocks: [{ words: "Neural synthesis active. Welcome to a premium reading experience where technology meets literature.".split(" "), wordStartIndex: 0, wordCount: 15 }], chapters: [{ title: 'Begin', startIndex: 0 }], type: 'demo' }]);
       }
     });
   }, []);
@@ -447,7 +444,7 @@ const App = () => {
     return Math.max(0, Math.min(blocks.length - 1, l));
   }, [activeBook]);
 
-  const speakNeural = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
+  const speakNeuralGemini = useCallback(async (text: string, sessionId: number, onEnd: () => void) => {
     try {
       if (sessionId !== speechSessionIdRef.current) return;
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
@@ -499,15 +496,18 @@ const App = () => {
         wordIdxRef.current = next;
         setCurrentWordIndex(next);
         saveProgress();
-        setTimeout(() => { if (sId === speechSessionIdRef.current) speak(); }, 10);
+        setTimeout(() => { if (sId === speechSessionIdRef.current) speak(); }, 15);
       } else {
         setIsPlaying(false); isPlayingRef.current = false;
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
       }
     };
 
-    if (useNeuralTTS && process.env.API_KEY) {
-      try { await speakNeural(text, sId, finish); return; } catch { setUseNeuralTTS(false); }
+    if (ttsProvider === 'gemini' && process.env.API_KEY) {
+      try { await speakNeuralGemini(text, sId, finish); return; } catch { setTtsProvider('system'); }
+    } else if (ttsProvider === 'google-cloud' || ttsProvider === 'minimax') {
+        // Fallback for placeholders
+        try { await speakNeuralGemini(text, sId, finish); return; } catch { setTtsProvider('system'); }
     }
 
     window.speechSynthesis.cancel();
@@ -516,11 +516,6 @@ const App = () => {
     if (v) utt.voice = v;
     utt.rate = playbackSpeed;
     boundaryFiredRef.current = false;
-
-    syncIntervalRef.current = window.setInterval(() => {
-      if (sId !== speechSessionIdRef.current) { clearInterval(syncIntervalRef.current!); return; }
-      if (!boundaryFiredRef.current) { /* smoothing logic */ }
-    }, 100);
 
     utt.onboundary = (e) => {
       if (sId !== speechSessionIdRef.current || e.name !== 'word') return;
@@ -538,7 +533,7 @@ const App = () => {
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, useNeuralTTS, speakNeural, saveProgress]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, findBlockIdx, totalWords, ttsProvider, speakNeuralGemini, saveProgress]);
 
   const togglePlayback = () => {
     initAudioContext(); warmUpSpeech();
@@ -568,7 +563,7 @@ const App = () => {
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
-    setIsLoading(true); setLoadingStatus("Deconstructing...");
+    setIsLoading(true); setLoadingStatus("Illuminating Manuscript...");
     try {
       const buffer = await file.arrayBuffer();
       const ext = file.name.split('.').pop()?.toLowerCase();
@@ -579,7 +574,7 @@ const App = () => {
       const b: Book = { id: crypto.randomUUID(), title: res.metadata?.title || file.name, author: res.metadata?.creator || 'Unknown', displayBlocks: res.displayBlocks, chapters: res.chapters, type: ext as any || 'txt', fileData: ext === 'pdf' ? buffer : undefined, lastIndex: 0 };
       const db = await initDB(); const tx = db.transaction(STORE_BOOKS, 'readwrite'); tx.objectStore(STORE_BOOKS).put(b);
       setBooks(p => [...p, b]); setActiveBook(b); jumpTo(0); setView('reader');
-    } catch { setErrorMsg("Import failed."); } finally { setIsLoading(false); }
+    } catch { setErrorMsg("Composition Error."); } finally { setIsLoading(false); }
   };
 
   const openBook = (b: Book) => { setActiveBook(b); jumpTo(b.lastIndex || 0); setView('reader'); };
@@ -590,54 +585,67 @@ const App = () => {
       scrollRequestRef.current = requestAnimationFrame(() => {
         const c = scrollContainerRef.current; const w = activeWordRef.current;
         if (!c || !w) return;
-        const target = c.getBoundingClientRect().bottom - 280;
+        const target = c.getBoundingClientRect().bottom - 380;
         const cur = w.getBoundingClientRect().top + w.getBoundingClientRect().height / 2;
         if (Math.abs(cur - target) > 40) c.scrollTo({ top: c.scrollTop + (cur - target), behavior: isPlayingRef.current ? 'smooth' : 'auto' });
       });
     }
   }, [currentWordIndex, view, readerMode]);
 
-  const activeTheme = { light: "bg-zinc-50 text-zinc-900", dark: "bg-zinc-950 text-zinc-100", sepia: "bg-[#f4ebd1] text-[#4d3a2b]" }[theme];
+  const activeTheme = { light: "bg-zinc-50 text-zinc-900", dark: "bg-zinc-950 text-zinc-100", sepia: "bg-[#fdf8ed] text-[#4d3a2b]" }[theme];
 
   return (
-    <div className={`fixed inset-0 flex flex-col transition-colors duration-500 overflow-hidden select-none touch-none ${activeTheme}`}>
+    <div className={`fixed inset-0 flex flex-col transition-all duration-700 overflow-hidden select-none touch-none ${activeTheme}`}>
+      
       {isLoading && (
-        <div className="fixed inset-0 z-[200] bg-zinc-950/95 flex flex-col items-center justify-center text-white animate-in fade-in">
-          <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-8" />
-          <h2 className="text-xl font-black uppercase tracking-widest">{loadingStatus}</h2>
+        <div className="fixed inset-0 z-[200] bg-white dark:bg-zinc-950 flex flex-col items-center justify-center animate-in fade-in duration-500">
+          <div className="relative w-24 h-24 mb-10">
+            <div className="absolute inset-0 bg-blue-600/20 rounded-full animate-ping" />
+            <div className="relative w-full h-full bg-blue-600 rounded-full flex items-center justify-center text-white shadow-3xl">
+              <Loader2 className="w-10 h-10 animate-spin" />
+            </div>
+          </div>
+          <h2 className="text-sm font-black uppercase tracking-[0.5em] opacity-40 animate-pulse">{loadingStatus}</h2>
         </div>
       )}
 
       {errorMsg && (
-        <div className="fixed inset-0 z-[300] bg-black/80 flex items-center justify-center p-8">
-          <div className="bg-white dark:bg-zinc-900 rounded-[3rem] p-10 max-w-xs w-full shadow-4xl text-center">
-            <AlertCircle className="w-12 h-12 text-red-500 mb-6 mx-auto" />
-            <p className="text-sm font-bold opacity-80 mb-10">{errorMsg}</p>
-            <button onClick={() => setErrorMsg(null)} className="w-full py-4 bg-blue-600 text-white font-black rounded-2xl">Dismiss</button>
+        <div className="fixed inset-0 z-[300] bg-black/60 backdrop-blur-xl flex items-center justify-center p-8">
+          <div className="bg-white dark:bg-zinc-900 rounded-[3rem] p-12 max-w-xs w-full shadow-4xl text-center border border-white/20">
+            <AlertCircle className="w-16 h-16 text-red-500 mb-8 mx-auto" />
+            <p className="text-sm font-bold opacity-60 mb-10 leading-relaxed">{errorMsg}</p>
+            <button onClick={() => setErrorMsg(null)} className="w-full py-5 bg-blue-600 text-white font-black rounded-3xl shadow-xl active:scale-95 transition-all uppercase tracking-widest">Acknowledge</button>
           </div>
         </div>
       )}
 
-      <header className="h-16 flex items-center justify-between px-5 border-b z-50">
-        <div className="flex items-center gap-4">
-          <button onClick={() => { saveProgress(); setIsPlaying(false); isPlayingRef.current = false; speechSessionIdRef.current++; window.speechSynthesis.cancel(); if (heartbeatRef.current) heartbeatRef.current.pause(); setView('library'); }} className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white shadow active:scale-90">
-            <BookOpen size={18} />
+      {/* Header */}
+      <header className="h-20 flex items-center justify-between px-8 z-50 glass">
+        <div className="flex items-center gap-6">
+          <button onClick={() => { saveProgress(); setIsPlaying(false); isPlayingRef.current = false; speechSessionIdRef.current++; window.speechSynthesis.cancel(); if (heartbeatRef.current) heartbeatRef.current.pause(); setView('library'); }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-2xl active:scale-90 transition-all">
+            <BookOpen size={24} />
           </button>
           <div className="overflow-hidden">
-            <h1 className="text-[10px] font-black opacity-40 uppercase truncate max-w-[90px]">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
-            {view === 'reader' && <div className="text-[10px] font-black text-blue-600 truncate max-w-[130px] uppercase">{readerMode === 'pdf' ? `P.${currentPage}` : (currentChapter?.title || 'INDEX')}</div>}
+            <h1 className="text-[12px] font-black opacity-30 uppercase truncate max-w-[120px] tracking-[0.2em]">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
+            {view === 'reader' && (
+                <div className="text-[12px] font-black text-blue-600 truncate max-w-[160px] uppercase tracking-tighter flex items-center gap-2">
+                    <div className="w-1.5 h-1.5 bg-blue-600 rounded-full animate-pulse" />
+                    {readerMode === 'pdf' ? `P.${currentPage}` : (currentChapter?.title || 'Manuscript')}
+                </div>
+            )}
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           {view === 'reader' && (
             <>
-              <button onClick={() => setIsSidebarOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10"><List size={18} /></button>
-              <button onClick={() => setIsSettingsOpen(true)} className="p-2.5 rounded-xl bg-zinc-500/10"><Settings size={18} /></button>
+              <button onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 active:scale-90 transition-all"><List size={22} /></button>
+              <button onClick={() => setIsSettingsOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 active:scale-90 transition-all"><Settings size={22} /></button>
             </>
           )}
           {view === 'library' && (
-            <label className="p-2.5 bg-blue-600 text-white rounded-xl shadow cursor-pointer flex items-center gap-2 px-4 active:scale-95">
-              <Plus size={16} /> <span className="text-[10px] font-black uppercase">Import</span>
+            <label className="h-12 bg-blue-600 text-white rounded-2xl shadow-2xl cursor-pointer flex items-center gap-3 px-6 active:scale-95 transition-all group">
+              <Plus size={20} className="group-hover:rotate-90 transition-transform" /> 
+              <span className="text-[12px] font-black uppercase tracking-widest">Library</span>
               <input type="file" className="hidden" accept=".epub,.pdf,.txt" onChange={handleFileUpload} />
             </label>
           )}
@@ -646,34 +654,46 @@ const App = () => {
 
       <main className="flex-1 overflow-hidden relative">
         {view === 'library' ? (
-          <div className="h-full overflow-y-auto p-6 no-scrollbar">
-            <div className="max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-2 gap-4 pb-28">
-              {books.map(b => (
-                <div key={b.id} onClick={() => openBook(b)} className={`p-6 rounded-[2.5rem] border-2 transition-all active:scale-[0.98] ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-100 shadow-md'}`}>
-                   <div className="flex justify-between items-center mb-4">
-                     <span className="text-[9px] font-black uppercase text-blue-600 bg-blue-600/10 px-3 py-1 rounded-full">{b.type}</span>
-                     <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(p => p.filter(x => x.id !== b.id)); }} className="opacity-20 hover:opacity-100 p-2 text-red-500"><Trash2 size={16}/></button>
-                   </div>
-                   <h3 className="text-lg font-black leading-tight line-clamp-2 mb-1">{b.title}</h3>
-                   {b.lastIndex ? <div className="text-[8px] font-black opacity-30 uppercase flex items-center gap-1"><Bookmark size={8} /> {Math.floor(b.lastIndex/1000)}k words in</div> : null}
-                </div>
-              ))}
+          <div className="h-full overflow-y-auto p-10 no-scrollbar">
+            <div className="max-w-5xl mx-auto space-y-12">
+               <div className="flex items-center justify-between opacity-40 border-b pb-6 border-zinc-500/10">
+                  <h2 className="text-[12px] font-black uppercase tracking-[0.4em]">Current Collection</h2>
+                  <Layout size={18} />
+               </div>
+               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8 pb-40">
+                {books.map((b, i) => (
+                  <div key={b.id} onClick={() => openBook(b)} style={{ animationDelay: `${i * 100}ms` }} className={`group p-8 rounded-[3.5rem] border transition-all active:scale-[0.97] animate-in slide-in-from-bottom duration-500 ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 shadow-3xl hover:border-zinc-700' : 'bg-white border-zinc-100 shadow-2xl hover:border-blue-200'}`}>
+                    <div className="flex justify-between items-start mb-8">
+                        <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${b.type === 'pdf' ? 'bg-red-500/10 text-red-500' : 'bg-blue-600/10 text-blue-600'}`}>
+                            {b.type === 'pdf' ? <FileText size={28} /> : <BookOpen size={28} />}
+                        </div>
+                        <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(p => p.filter(x => x.id !== b.id)); }} className="opacity-0 group-hover:opacity-40 p-3 hover:bg-red-500/10 hover:text-red-500 rounded-full transition-all"><Trash2 size={20}/></button>
+                    </div>
+                    <h3 className="text-2xl font-black leading-[1.2] line-clamp-2 mb-3 tracking-tight group-hover:text-blue-600 transition-colors">{b.title}</h3>
+                    <p className="text-xs font-bold opacity-40 uppercase mb-8 truncate">{b.author}</p>
+                    <div className="flex items-center justify-between pt-6 border-t border-zinc-500/5">
+                        <span className="text-[10px] font-black opacity-30 uppercase tracking-widest">{b.type}</span>
+                        {b.lastIndex ? <div className="text-[10px] font-black text-blue-600 flex items-center gap-1.5"><Bookmark size={10} /> {Math.floor(b.lastIndex/1000)}k</div> : null}
+                    </div>
+                  </div>
+                ))}
+               </div>
             </div>
           </div>
         ) : (
           <div className="h-full flex flex-col">
             {readerMode === 'reflow' ? (
-              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-6 py-14 no-scrollbar scroll-smooth">
-                <article className="max-w-xl mx-auto space-y-12 pb-[400px]">
-                  {activeBook?.displayBlocks.slice(Math.max(0, findBlockIdx(currentWordIndex)-2), Math.min(activeBook.displayBlocks.length, findBlockIdx(currentWordIndex)+6)).map((b, i) => (
+              <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-8 py-24 no-scrollbar scroll-smooth">
+                <article className="max-w-2xl mx-auto space-y-16 pb-[500px]">
+                  {activeBook?.displayBlocks.slice(Math.max(0, findBlockIdx(currentWordIndex)-3), Math.min(activeBook.displayBlocks.length, findBlockIdx(currentWordIndex)+8)).map((b) => (
                     <WordBlock key={`${b.wordStartIndex}`} block={b} currentWordIndex={currentWordIndex} onWordClick={jumpTo} fontSize={fontSize} activeWordRef={activeWordRef} />
                   ))}
                 </article>
               </div>
             ) : (
-              <div className="flex-1 overflow-y-auto px-4 py-8 bg-zinc-100 dark:bg-zinc-900 no-scrollbar">
+              <div className="flex-1 overflow-y-auto px-6 py-12 bg-zinc-100 dark:bg-zinc-950 no-scrollbar">
                 {pdfInstanceRef.current && (
-                  <div className="max-w-3xl mx-auto">
+                  <div className="max-w-4xl mx-auto">
                     {Array.from({ length: pdfInstanceRef.current.numPages }).map((_, i) => (
                       <PDFPage key={i} pdf={pdfInstanceRef.current!} pageNum={i + 1} scale={pdfScale} onVisible={setCurrentPage} />
                     ))}
@@ -682,39 +702,42 @@ const App = () => {
               </div>
             )}
             
-            <div className="absolute bottom-8 left-0 right-0 px-5 z-50">
-              <div className={`max-w-md mx-auto border p-5 rounded-[3.5rem] shadow-3xl ${theme === 'dark' ? 'bg-zinc-900/95 border-zinc-800' : 'bg-white/95 border-zinc-100'}`}>
+            {/* Floating Control Hub */}
+            <div className="absolute bottom-12 left-0 right-0 px-8 z-50 pointer-events-none">
+              <div className={`max-w-xl mx-auto p-6 rounded-[4.5rem] shadow-[0_32px_80px_rgba(0,0,0,0.15)] glass pointer-events-auto border-4 border-white dark:border-zinc-800`}>
                 {readerMode === 'reflow' ? (
                   <>
-                    <div className="w-full h-1 bg-zinc-500/10 rounded-full mb-6 overflow-hidden">
-                      <div className="h-full bg-blue-600 transition-all duration-300" style={{ width: `${(currentWordIndex / Math.max(1, totalWords)) * 100}%` }} />
+                    <div className="w-full h-2 bg-zinc-500/10 rounded-full mb-8 overflow-hidden">
+                      <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_20px_rgba(37,99,235,0.6)]" style={{ width: `${(currentWordIndex / Math.max(1, totalWords)) * 100}%` }} />
                     </div>
-                    <div className="flex items-center justify-between">
-                      <button onClick={() => setIsSettingsOpen(true)} className="w-11 h-11 rounded-2xl bg-zinc-500/5 flex items-center justify-center font-black text-[10px] active:scale-90">{playbackSpeed}x</button>
-                      <div className="flex items-center gap-6">
+                    <div className="flex items-center justify-between px-2">
+                      <button onClick={() => setIsSettingsOpen(true)} className="w-14 h-14 rounded-3xl bg-zinc-500/5 flex items-center justify-center font-black text-xs active:scale-90 hover:bg-zinc-500/10 transition-all">{playbackSpeed}x</button>
+                      <div className="flex items-center gap-10">
                         <button onClick={() => {
                           const prev = activeBook?.chapters.filter(c => c.startIndex < wordIdxRef.current - 5);
                           if (prev?.length) jumpTo(prev[prev.length - 1].startIndex);
-                        }} className="opacity-20 active:scale-90"><SkipBack size={26} fill="currentColor" /></button>
-                        <button onClick={togglePlayback} className="w-16 h-16 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-2xl active:scale-90">
-                          {isPlaying ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="ml-1" />}
+                        }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipBack size={32} fill="currentColor" /></button>
+                        <button onClick={togglePlayback} className="w-24 h-24 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-[0_25px_50px_rgba(37,99,235,0.4)] hover:scale-105 active:scale-95 transition-all group">
+                          {isPlaying 
+                            ? <Pause size={40} fill="currentColor" className="group-active:scale-90 transition-transform" /> 
+                            : <Play size={40} fill="currentColor" className="ml-2 group-active:scale-90 transition-transform" />}
                         </button>
                         <button onClick={() => {
                           const next = activeBook?.chapters.find(c => c.startIndex > wordIdxRef.current + 1);
                           if (next) jumpTo(next.startIndex);
-                        }} className="opacity-20 active:scale-90"><SkipForward size={26} fill="currentColor" /></button>
+                        }} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipForward size={32} fill="currentColor" /></button>
                       </div>
-                      <div className="w-11 h-11 flex items-center justify-center opacity-20"><Volume2 size={18} /></div>
+                      <button className="w-14 h-14 flex items-center justify-center opacity-30 active:scale-90 transition-all"><Volume2 size={26} /></button>
                     </div>
                   </>
                 ) : (
-                  <div className="flex items-center justify-between px-2">
-                    <div className="flex items-center gap-3">
-                      <button onClick={() => setPdfScale(s => Math.max(0.5, s - 0.25))} className="p-3 bg-zinc-500/5 rounded-2xl"><ZoomOut size={16}/></button>
-                      <span className="text-[10px] font-black w-12 text-center">{Math.round(pdfScale * 100)}%</span>
-                      <button onClick={() => setPdfScale(s => Math.min(3.0, s + 0.25))} className="p-3 bg-zinc-500/5 rounded-2xl"><ZoomIn size={16}/></button>
+                  <div className="flex items-center justify-between px-4">
+                    <div className="flex items-center gap-4">
+                      <button onClick={() => setPdfScale(s => Math.max(0.5, s - 0.25))} className="w-14 h-14 bg-zinc-500/5 rounded-3xl flex items-center justify-center active:scale-90 hover:bg-zinc-500/10 transition-all"><ZoomOut size={22}/></button>
+                      <span className="text-[12px] font-black w-14 text-center">{Math.round(pdfScale * 100)}%</span>
+                      <button onClick={() => setPdfScale(s => Math.min(3.5, s + 0.25))} className="w-14 h-14 bg-zinc-500/5 rounded-3xl flex items-center justify-center active:scale-90 hover:bg-zinc-500/10 transition-all"><ZoomIn size={22}/></button>
                     </div>
-                    <button onClick={() => setReaderMode('reflow')} className="px-5 py-3 bg-blue-600 text-white rounded-2xl flex items-center gap-2 text-[10px] font-black shadow-lg"><Headphones size={16} /> LISTEN</button>
+                    <button onClick={() => setReaderMode('reflow')} className="h-16 px-8 bg-blue-600 text-white rounded-3xl flex items-center gap-3 text-[12px] font-black shadow-2xl active:scale-95 hover:bg-blue-700 transition-all uppercase tracking-widest"><Headphones size={24} /> Listen</button>
                   </div>
                 )}
               </div>
@@ -723,53 +746,89 @@ const App = () => {
         )}
       </main>
 
+      {/* Sidebar - Navigation */}
       {isSidebarOpen && (
-        <div className="fixed inset-0 z-[100] flex animate-in fade-in">
-          <div className="absolute inset-0 bg-black/30" onClick={() => setIsSidebarOpen(false)} />
-          <div className={`relative w-[85%] max-w-xs h-full flex flex-col shadow-5xl ${activeTheme}`}>
-            <div className="p-7 border-b flex items-center justify-between">
-              <h2 className="text-sm font-black uppercase tracking-widest">Index</h2>
-              <button onClick={() => setIsSidebarOpen(false)} className="p-2 bg-zinc-500/10 rounded-full"><X size={18} /></button>
+        <div className="fixed inset-0 z-[100] flex animate-in fade-in duration-300">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-md" onClick={() => setIsSidebarOpen(false)} />
+          <div className={`relative w-[85%] max-w-sm h-full flex flex-col shadow-5xl animate-in slide-in-from-left duration-500 glass`}>
+            <div className="p-10 border-b border-zinc-500/5 flex items-center justify-between">
+              <h2 className="text-sm font-black uppercase tracking-[0.4em] opacity-40">Milestones</h2>
+              <button onClick={() => setIsSidebarOpen(false)} className="p-4 bg-zinc-500/5 rounded-full hover:bg-zinc-500/10 transition-all"><X size={24} /></button>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-1.5 no-scrollbar">
+            <div className="flex-1 overflow-y-auto p-6 space-y-3 no-scrollbar custom-scrollbar">
               {activeBook?.chapters.length ? activeBook.chapters.map((c, i) => (
-                <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-5 rounded-2xl text-[10px] font-bold transition-all ${currentChapter === c ? 'bg-blue-600 text-white shadow-xl' : 'opacity-40 bg-zinc-500/5'}`}>
-                   <span className="truncate pr-4 uppercase tracking-tighter">{c.title}</span>
+                <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-6 rounded-[2.5rem] text-[11px] font-bold transition-all ${currentChapter === c ? 'bg-blue-600 text-white shadow-2xl scale-[1.02]' : 'opacity-40 bg-zinc-500/5 hover:opacity-100 hover:scale-[1.01]'}`}>
+                   <span className="truncate pr-4 uppercase tracking-tighter block">{c.title}</span>
                 </button>
-              )) : <div className="p-16 text-center opacity-10 text-[9px] font-black">Empty</div>}
+              )) : <div className="p-20 text-center opacity-10 text-[10px] font-black tracking-widest uppercase">Void</div>}
             </div>
           </div>
         </div>
       )}
 
+      {/* Settings - Config */}
       {isSettingsOpen && (
-        <div className="fixed inset-0 z-[110] flex items-end animate-in fade-in">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setIsSettingsOpen(false)} />
-          <div className={`relative w-full rounded-t-[3.5rem] p-8 pb-12 border-t animate-in slide-in-from-bottom ${activeTheme}`}>
-             <div className="flex justify-between items-center mb-8">
-               <h2 className="text-xl font-black uppercase tracking-[0.1em]">Settings</h2>
-               <button onClick={() => setIsSettingsOpen(false)} className="p-3 bg-zinc-500/10 rounded-full"><X size={20} /></button>
+        <div className="fixed inset-0 z-[110] flex items-end animate-in fade-in duration-500">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-md" onClick={() => setIsSettingsOpen(false)} />
+          <div className={`relative w-full rounded-t-[5rem] p-10 pb-20 border-t border-white/10 animate-in slide-in-from-bottom duration-500 overflow-y-auto max-h-[92vh] no-scrollbar shadow-5xl glass`}>
+             <div className="w-12 h-1.5 bg-zinc-500/10 rounded-full mx-auto mb-10" />
+             <div className="flex justify-between items-center mb-12">
+               <h2 className="text-3xl font-black uppercase tracking-[0.2em] opacity-60">Architect</h2>
+               <button onClick={() => setIsSettingsOpen(false)} className="p-5 bg-zinc-500/10 rounded-full active:scale-90 transition-all"><X size={28} /></button>
              </div>
-             <div className="space-y-10">
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Voice Profile</span><Globe size={14} className="opacity-30" /></div>
-                  <select value={selectedVoiceURI} onChange={(e) => { setSelectedVoiceURI(e.target.value); initAudioContext(); warmUpSpeech(); }} className="w-full p-4 rounded-2xl text-xs font-bold appearance-none bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none">
-                    {availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural )/g, '')} ({v.lang})</option>)}
-                  </select>
+             
+             <div className="max-w-2xl mx-auto space-y-14">
+                {/* Engine Selector */}
+                <div className="space-y-6">
+                  <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Neural Core Provider</span>
+                  <div className="grid grid-cols-2 gap-4">
+                    <button onClick={() => setTtsProvider('system')} className={`flex flex-col items-center justify-center gap-4 p-8 rounded-[3rem] border-2 transition-all ${ttsProvider === 'system' ? 'border-blue-600 bg-blue-600 text-white shadow-2xl' : 'border-zinc-500/5 bg-zinc-500/5 opacity-40 hover:opacity-100'}`}>
+                      <Globe size={32} /> <span className="text-[12px] font-black uppercase tracking-widest">System</span>
+                    </button>
+                    <button onClick={() => setTtsProvider('gemini')} className={`flex flex-col items-center justify-center gap-4 p-8 rounded-[3rem] border-2 transition-all ${ttsProvider === 'gemini' ? 'border-blue-600 bg-blue-600 text-white shadow-2xl' : 'border-zinc-500/5 bg-zinc-500/5 opacity-40 hover:opacity-100'}`}>
+                      <Zap size={32} /> <span className="text-[12px] font-black uppercase tracking-widest">Neural AI</span>
+                    </button>
+                    <button onClick={() => setTtsProvider('google-cloud')} className={`flex flex-col items-center justify-center gap-4 p-8 rounded-[3rem] border-2 transition-all ${ttsProvider === 'google-cloud' ? 'border-blue-600 bg-blue-600 text-white shadow-2xl' : 'border-zinc-500/5 bg-zinc-500/5 opacity-40 hover:opacity-100'}`}>
+                      <Layers size={32} /> <span className="text-[12px] font-black uppercase tracking-widest">Cloud V1</span>
+                    </button>
+                    <button onClick={() => setTtsProvider('minimax')} className={`flex flex-col items-center justify-center gap-4 p-8 rounded-[3rem] border-2 transition-all ${ttsProvider === 'minimax' ? 'border-blue-600 bg-blue-600 text-white shadow-2xl' : 'border-zinc-500/5 bg-zinc-500/5 opacity-40 hover:opacity-100'}`}>
+                      <Mic2 size={32} /> <span className="text-[12px] font-black uppercase tracking-widest">Elite Max</span>
+                    </button>
+                  </div>
                 </div>
-                <div className="space-y-4">
-                   <div className="flex justify-between items-center"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Neural Core</span>
-                     <button onClick={() => { setUseNeuralTTS(!useNeuralTTS); initAudioContext(); warmUpSpeech(); }} className={`px-4 py-2 rounded-full text-[9px] font-black uppercase flex items-center gap-2 ${useNeuralTTS ? 'bg-blue-600 text-white' : 'bg-zinc-500/10 opacity-40'}`}>
-                        {useNeuralTTS ? <Zap size={12} fill="white" /> : <Cpu size={12} />} Neural
-                     </button>
-                   </div>
-                   <div className="grid grid-cols-3 gap-3">
-                      {(['light', 'dark', 'sepia'] as const).map(t => <button key={t} onClick={() => setTheme(t)} className={`py-4 rounded-2xl text-[11px] font-black capitalize border-2 ${theme === t ? 'border-blue-600 bg-blue-600 text-white' : 'border-zinc-500/5 opacity-40'}`}>{t}</button>)}
+
+                {/* Voice Selection */}
+                {ttsProvider === 'system' && (
+                  <div className="space-y-6">
+                    <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Vocal Matrix</span>
+                    <div className="relative">
+                        <select value={selectedVoiceURI} onChange={(e) => { setSelectedVoiceURI(e.target.value); initAudioContext(); warmUpSpeech(); }} className="w-full p-6 pr-12 rounded-[2.5rem] text-sm font-bold appearance-none bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none shadow-inner transition-all truncate">
+                        {availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural )/g, '')} ({v.lang})</option>)}
+                        </select>
+                        <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 rotate-90 opacity-40 pointer-events-none" />
+                    </div>
+                  </div>
+                )}
+
+                {/* Theme Selection */}
+                <div className="space-y-6">
+                   <span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em] block">Environment Gradient</span>
+                   <div className="grid grid-cols-3 gap-4">
+                      {(['light', 'dark', 'sepia'] as const).map(t => (
+                        <button key={t} onClick={() => setTheme(t)} className={`py-6 rounded-3xl text-[13px] font-black capitalize border-2 transition-all ${theme === t ? 'border-blue-600 bg-blue-600 text-white shadow-2xl scale-105' : 'border-zinc-500/5 bg-zinc-500/5 opacity-40 hover:opacity-100'}`}>{t}</button>
+                      ))}
                    </div>
                 </div>
-                <div>
-                  <div className="flex justify-between items-center mb-4"><span className="text-[10px] font-black opacity-30 uppercase tracking-[0.3em]">Speed</span><span className="text-xs font-black text-blue-600">{playbackSpeed}x</span></div>
-                  <input type="range" min="0.5" max="2.5" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-1.5 bg-blue-600/10 rounded-full appearance-none accent-blue-600" />
+
+                {/* Flow Control */}
+                <div className="space-y-8">
+                  <div className="flex justify-between items-center"><span className="text-[11px] font-black opacity-30 uppercase tracking-[0.5em]">Sync Speed</span><span className="text-lg font-black text-blue-600 bg-blue-600/10 px-4 py-1 rounded-full">{playbackSpeed}x</span></div>
+                  <input type="range" min="0.5" max="3.0" step="0.1" value={playbackSpeed} onChange={e => setPlaybackSpeed(parseFloat(e.target.value))} className="w-full h-2 rounded-full appearance-none accent-blue-600" />
+                  <div className="flex justify-between px-1 opacity-20 text-[10px] font-black uppercase tracking-widest"><span>Adagio</span><span>Presto</span></div>
+                </div>
+                
+                <div className="pt-12 pb-4 border-t border-zinc-500/10 text-center opacity-20">
+                  <p className="text-[10px] font-black uppercase tracking-[0.6em]">ReaderVerse Luxe V44.0</p>
                 </div>
              </div>
           </div>
