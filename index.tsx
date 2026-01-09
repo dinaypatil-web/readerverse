@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from '
 import { createRoot } from 'react-dom/client';
 import { 
   Play, Pause, SkipForward, SkipBack, Settings, X, 
-  List, Loader2, BookOpen, Trash2, Plus, FileText, Headphones, Bookmark, ChevronRight, Volume2, Globe, Zap
+  List, Loader2, BookOpen, Trash2, Plus, FileText, Headphones, Bookmark, ChevronRight, Volume2, Globe, Zap, Trash
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -26,19 +26,27 @@ interface TextBlock {
   wordCount: number;
 }
 
+interface UserBookmark {
+  id: string;
+  index: number;
+  label: string;
+  timestamp: number;
+}
+
 interface Book {
   id: string;
   title: string;
   author: string;
   displayBlocks: TextBlock[];
   chapters: ChapterEntry[];
+  bookmarks: UserBookmark[];
   type: 'epub' | 'pdf' | 'txt' | 'demo';
   fileData?: ArrayBuffer;
   lastIndex?: number; 
 }
 
 // --- Persistence ---
-const DB_NAME = 'ReaderVerse_V52_PERF';
+const DB_NAME = 'ReaderVerse_V53_BOOKMARKS';
 const STORE_BOOKS = 'books';
 
 const initDB = (): Promise<IDBDatabase> => {
@@ -73,13 +81,19 @@ const updateBookProgress = async (bookId: string, index: number) => {
   };
 };
 
+const saveBookToDB = async (book: Book) => {
+  const db = await initDB();
+  const tx = db.transaction(STORE_BOOKS, 'readwrite');
+  tx.objectStore(STORE_BOOKS).put(book);
+};
+
 const getBooks = async (): Promise<Book[]> => {
   try {
     const db = await initDB();
     return new Promise((resolve) => {
       const tx = db.transaction(STORE_BOOKS, 'readonly');
       const req = tx.objectStore(STORE_BOOKS).getAll();
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => resolve(req.result.map((b: any) => ({ ...b, bookmarks: b.bookmarks || [] })));
       req.onerror = () => resolve([]);
     });
   } catch (e) {
@@ -325,6 +339,7 @@ const App = () => {
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>("");
   const [ttsProvider, setTtsProvider] = useState<TtsProvider>('system');
+  const [sidebarTab, setSidebarTab] = useState<'chapters' | 'bookmarks'>('chapters');
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeWordRef = useRef<HTMLSpanElement | null>(null);
@@ -428,12 +443,18 @@ const App = () => {
     return chapters[0];
   }, [activeBook, currentWordIndex]);
 
-  const saveProgressThrottled = useCallback(() => {
-    if (activeBook && Math.abs(wordIdxRef.current - lastSavedIndexRef.current) > 200) {
+  const saveProgressImmediate = useCallback(() => {
+    if (activeBook) {
       updateBookProgress(activeBook.id, wordIdxRef.current);
       lastSavedIndexRef.current = wordIdxRef.current;
     }
   }, [activeBook]);
+
+  const saveProgressThrottled = useCallback(() => {
+    if (activeBook && Math.abs(wordIdxRef.current - lastSavedIndexRef.current) > 200) {
+      saveProgressImmediate();
+    }
+  }, [activeBook, saveProgressImmediate]);
 
   const initAudioContext = useCallback(() => {
     if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -517,6 +538,7 @@ const App = () => {
         if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
         if (heartbeatRef.current) heartbeatRef.current.pause();
         releaseWakeLock();
+        saveProgressImmediate();
       }
     };
 
@@ -550,7 +572,7 @@ const App = () => {
     utt.onend = () => { if (sId === speechSessionIdRef.current) finish(); };
     utt.onerror = () => { if (sId === speechSessionIdRef.current) finish(); };
     window.speechSynthesis.speak(utt);
-  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition, requestWakeLock, releaseWakeLock]);
+  }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition, requestWakeLock, releaseWakeLock, saveProgressImmediate]);
 
   const jumpTo = useCallback((idx: number) => {
     initAudioContext();
@@ -574,7 +596,7 @@ const App = () => {
       speechSessionIdRef.current++;
       if (heartbeatRef.current) heartbeatRef.current.pause();
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-      if (activeBook) updateBookProgress(activeBook.id, wordIdxRef.current);
+      saveProgressImmediate();
       releaseWakeLock();
     } else {
       setIsPlaying(true); isPlayingRef.current = true;
@@ -584,7 +606,36 @@ const App = () => {
       requestWakeLock();
       speak();
     }
-  }, [speak, initAudioContext, activeBook, requestWakeLock, releaseWakeLock]);
+  }, [speak, initAudioContext, saveProgressImmediate, requestWakeLock, releaseWakeLock]);
+
+  const addBookmark = useCallback(() => {
+    if (!activeBook) return;
+    const idx = wordIdxRef.current;
+    const bIdx = findBlockIdx(idx, activeBook);
+    const block = activeBook.displayBlocks[bIdx];
+    const offset = Math.max(0, idx - block.wordStartIndex);
+    const snippet = block.words.slice(offset, offset + 10).join(" ") + "...";
+    
+    const newBookmark: UserBookmark = {
+      id: crypto.randomUUID(),
+      index: idx,
+      label: snippet,
+      timestamp: Date.now()
+    };
+
+    const updatedBook = { ...activeBook, bookmarks: [...(activeBook.bookmarks || []), newBookmark] };
+    setActiveBook(updatedBook);
+    saveBookToDB(updatedBook);
+    setBooks(prev => prev.map(b => b.id === activeBook.id ? updatedBook : b));
+  }, [activeBook]);
+
+  const deleteBookmark = useCallback((id: string) => {
+    if (!activeBook) return;
+    const updatedBook = { ...activeBook, bookmarks: activeBook.bookmarks.filter(bm => bm.id !== id) };
+    setActiveBook(updatedBook);
+    saveBookToDB(updatedBook);
+    setBooks(prev => prev.map(b => b.id === activeBook.id ? updatedBook : b));
+  }, [activeBook]);
 
   // MediaSession Handlers
   useEffect(() => {
@@ -619,9 +670,18 @@ const App = () => {
         const ws = txt.split(/\s+/).filter(w => w.length > 0);
         res = { displayBlocks: [{ words: ws, wordStartIndex: 0, wordCount: ws.length }], chapters: [], metadata: { title: file.name } };
       }
-      const b: Book = { id: crypto.randomUUID(), title: res.metadata?.title || file.name, author: res.metadata?.creator || 'Unknown', displayBlocks: res.displayBlocks, chapters: res.chapters, type: ext as any || 'txt', fileData: ext === 'pdf' ? buffer : undefined, lastIndex: 0 };
-      const db = await initDB();
-      db.transaction(STORE_BOOKS, 'readwrite').objectStore(STORE_BOOKS).put(b);
+      const b: Book = { 
+        id: crypto.randomUUID(), 
+        title: res.metadata?.title || file.name, 
+        author: res.metadata?.creator || 'Unknown', 
+        displayBlocks: res.displayBlocks, 
+        chapters: res.chapters, 
+        bookmarks: [],
+        type: ext as any || 'txt', 
+        fileData: ext === 'pdf' ? buffer : undefined, 
+        lastIndex: 0 
+      };
+      await saveBookToDB(b);
       setBooks(p => [...p, b]); setActiveBook(b); jumpTo(0); setView('reader');
       if (ext === 'pdf') {
          pdfInstanceRef.current = await pdfjsLib.getDocument({ data: buffer }).promise;
@@ -685,9 +745,10 @@ const App = () => {
             isPlayingRef.current = false; 
             window.speechSynthesis.cancel(); 
             if (heartbeatRef.current) heartbeatRef.current.pause();
+            saveProgressImmediate();
             releaseWakeLock();
             setView('library'); 
-          }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-xl active:scale-90 transition-all"><BookOpen size={24} /></button>
+          }} className="w-12 h-12 bg-blue-600 rounded-2xl flex items-center justify-center text-white shadow-xl active:scale-90 transition-all hover:scale-105"><BookOpen size={24} /></button>
           <div className="overflow-hidden">
             <h1 className="text-[12px] font-black opacity-30 uppercase truncate max-w-[120px] tracking-widest">{view === 'reader' && activeBook ? activeBook.title : 'ReaderVerse'}</h1>
           </div>
@@ -696,6 +757,7 @@ const App = () => {
           {view === 'reader' && (
             <>
               <button onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 transition-all"><List size={22} /></button>
+              <button onClick={addBookmark} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 transition-all text-blue-600"><Bookmark size={22} fill="currentColor" /></button>
               <button onClick={() => setIsSettingsOpen(true)} className="w-12 h-12 flex items-center justify-center rounded-2xl bg-zinc-500/5 hover:bg-zinc-500/10 transition-all"><Settings size={22} /></button>
             </>
           )}
@@ -711,19 +773,25 @@ const App = () => {
       <main className="flex-1 overflow-hidden relative">
         {view === 'library' ? (
           <div className="h-full overflow-y-auto p-10 no-scrollbar">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8 pb-32">
               {books.map(b => (
-                <div key={b.id} onClick={() => openBook(b)} className="p-8 rounded-[3.5rem] border bg-white dark:bg-zinc-900 dark:border-zinc-800 shadow-xl active:scale-95 transition-all group">
+                <div key={b.id} onClick={() => openBook(b)} className="p-8 rounded-[3.5rem] border bg-white dark:bg-zinc-900 dark:border-zinc-800 shadow-xl active:scale-95 transition-all group cursor-pointer hover:shadow-2xl">
                   <div className="flex justify-between mb-8">
                     <div className="w-14 h-14 bg-blue-600/10 text-blue-600 rounded-2xl flex items-center justify-center"><BookOpen size={28} /></div>
-                    <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(p => p.filter(x => x.id !== b.id)); }} className="opacity-0 group-hover:opacity-40 p-3"><Trash2 size={20}/></button>
+                    <button onClick={(e) => { e.stopPropagation(); removeBookFromDB(b.id); setBooks(p => p.filter(x => x.id !== b.id)); }} className="opacity-0 group-hover:opacity-40 p-3 hover:text-red-500 transition-all"><Trash2 size={20}/></button>
                   </div>
                   <h3 className="text-xl font-black mb-2 line-clamp-2">{b.title}</h3>
-                  <p className="text-[10px] font-black opacity-30 uppercase tracking-widest">{b.type}</p>
+                  <div className="flex justify-between items-center">
+                    <p className="text-[10px] font-black opacity-30 uppercase tracking-widest">{b.type}</p>
+                    {b.bookmarks?.length > 0 && <div className="flex items-center gap-1 opacity-40 text-[10px] font-black uppercase"><Bookmark size={10} fill="currentColor"/> {b.bookmarks.length}</div>}
+                  </div>
                 </div>
               ))}
               {books.length === 0 && (
-                <div className="col-span-full py-40 text-center opacity-20 uppercase font-black tracking-widest text-sm">Library Empty</div>
+                <div className="col-span-full py-40 text-center flex flex-col items-center opacity-20">
+                    <BookOpen size={64} className="mb-6" />
+                    <span className="uppercase font-black tracking-widest text-sm">Library Empty</span>
+                </div>
               )}
             </div>
           </div>
@@ -745,21 +813,58 @@ const App = () => {
               </div>
             )}
             
-            <div className="absolute bottom-12 left-0 right-0 px-8 z-50 pointer-events-none">
-              <div className="max-w-xl mx-auto p-6 rounded-[4.5rem] shadow-2xl glass pointer-events-auto border-4 border-white dark:border-zinc-800">
-                <div className="w-full h-1.5 bg-zinc-500/10 rounded-full mb-8 overflow-hidden">
-                  <div className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_15px_rgba(37,99,235,0.4)]" style={{ width: `${(currentWordIndex / Math.max(1, totalWordsCount)) * 100}%` }} />
+            {/* SLEEK ON-SCREEN CONTROLS */}
+            <div className="absolute bottom-10 left-0 right-0 px-6 z-50 pointer-events-none flex justify-center">
+              <div className="w-full max-w-lg glass pointer-events-auto rounded-full border border-white/20 dark:border-white/5 shadow-[0_25px_60px_rgba(0,0,0,0.15)] overflow-hidden flex flex-col">
+                {/* Slim Integrated Progress Bar */}
+                <div className="w-full h-[3px] bg-zinc-500/10 flex">
+                   <div 
+                    className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_8px_rgba(37,99,235,0.6)]" 
+                    style={{ width: `${(currentWordIndex / Math.max(1, totalWordsCount)) * 100}%` }} 
+                   />
                 </div>
-                <div className="flex items-center justify-between px-2">
-                  <button onClick={() => setIsSettingsOpen(true)} className="w-14 h-14 rounded-3xl bg-zinc-500/5 flex items-center justify-center font-black text-xs active:scale-90 transition-all">{playbackSpeed}x</button>
-                  <div className="flex items-center gap-8">
-                    <button onClick={() => jumpTo(wordIdxRef.current - 500)} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipBack size={32} fill="currentColor" /></button>
-                    <button onClick={togglePlayback} className="w-20 h-20 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-2xl active:scale-95 transition-all">
-                      {isPlaying ? <Pause size={36} fill="currentColor" /> : <Play size={36} fill="currentColor" className="ml-1" />}
+
+                {/* Elegant Controls Pill */}
+                <div className="px-3 py-2.5 flex items-center justify-between gap-1">
+                  {/* Left: Speed Indicator */}
+                  <button 
+                    onClick={() => setIsSettingsOpen(true)} 
+                    className="h-10 px-4 rounded-full bg-zinc-500/5 flex items-center justify-center active:scale-95 transition-all group"
+                  >
+                    <span className="text-[10px] font-black text-blue-600/60 group-hover:text-blue-600">{playbackSpeed}x</span>
+                  </button>
+
+                  {/* Center: Playback Core */}
+                  <div className="flex items-center gap-1.5">
+                    <button 
+                        onClick={() => jumpTo(wordIdxRef.current - 500)} 
+                        className="w-10 h-10 flex items-center justify-center rounded-full opacity-40 hover:opacity-100 active:scale-90 transition-all"
+                    >
+                        <SkipBack size={20} fill="currentColor" />
                     </button>
-                    <button onClick={() => jumpTo(wordIdxRef.current + 500)} className="opacity-30 hover:opacity-100 active:scale-90 transition-all"><SkipForward size={32} fill="currentColor" /></button>
+                    
+                    <button 
+                        onClick={togglePlayback} 
+                        className="w-14 h-14 bg-blue-600 text-white rounded-full flex items-center justify-center shadow-lg active:scale-95 transition-all hover:bg-blue-500"
+                    >
+                      {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" className="ml-0.5" />}
+                    </button>
+                    
+                    <button 
+                        onClick={() => jumpTo(wordIdxRef.current + 500)} 
+                        className="w-10 h-10 flex items-center justify-center rounded-full opacity-40 hover:opacity-100 active:scale-90 transition-all"
+                    >
+                        <SkipForward size={20} fill="currentColor" />
+                    </button>
                   </div>
-                  <button className="w-14 h-14 opacity-30"><Volume2 size={26} /></button>
+
+                  {/* Right: Bookmark / Audio Status */}
+                  <button 
+                    onClick={addBookmark}
+                    className="w-10 h-10 flex items-center justify-center rounded-full bg-zinc-500/5 text-blue-600 active:scale-95 transition-all"
+                  >
+                    <Bookmark size={20} fill="currentColor" />
+                  </button>
                 </div>
               </div>
             </div>
@@ -770,17 +875,52 @@ const App = () => {
       {isSidebarOpen && (
         <div className="fixed inset-0 z-[100] flex animate-in fade-in">
           <div className="absolute inset-0 bg-black/40 backdrop-blur-md" onClick={() => setIsSidebarOpen(false)} />
-          <div className="relative w-[80%] max-w-sm h-full flex flex-col shadow-2xl animate-in slide-in-from-left glass">
+          <div className="relative w-[85%] max-w-sm h-full flex flex-col shadow-2xl animate-in slide-in-from-left glass">
             <div className="p-10 border-b border-zinc-500/5 flex justify-between items-center">
-              <h2 className="text-sm font-black uppercase tracking-widest opacity-40">Milestones</h2>
+              <div className="flex gap-4">
+                <button 
+                  onClick={() => setSidebarTab('chapters')} 
+                  className={`text-[11px] font-black uppercase tracking-widest transition-all ${sidebarTab === 'chapters' ? 'text-blue-600 scale-110' : 'opacity-30'}`}
+                >
+                  Chapters
+                </button>
+                <button 
+                  onClick={() => setSidebarTab('bookmarks')} 
+                  className={`text-[11px] font-black uppercase tracking-widest transition-all ${sidebarTab === 'bookmarks' ? 'text-blue-600 scale-110' : 'opacity-30'}`}
+                >
+                  Bookmarks
+                </button>
+              </div>
               <button onClick={() => setIsSidebarOpen(false)} className="p-3 bg-zinc-500/5 rounded-full"><X size={20}/></button>
             </div>
             <div className="flex-1 overflow-y-auto p-6 space-y-3 custom-scrollbar no-scrollbar">
-              {activeBook?.chapters.map((c, i) => (
-                <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-6 rounded-[2.5rem] text-[11px] font-bold transition-all ${currentChapter === c ? 'bg-blue-600 text-white shadow-xl scale-[1.02]' : 'opacity-40 bg-zinc-500/5 hover:opacity-100'}`}>
-                  {c.title}
-                </button>
-              ))}
+              {sidebarTab === 'chapters' ? (
+                activeBook?.chapters.map((c, i) => (
+                  <button key={i} onClick={() => { jumpTo(c.startIndex); setIsSidebarOpen(false); }} className={`w-full text-left p-6 rounded-[2.5rem] text-[11px] font-bold transition-all ${currentChapter === c ? 'bg-blue-600 text-white shadow-xl scale-[1.02]' : 'opacity-40 bg-zinc-500/5 hover:opacity-100'}`}>
+                    {c.title}
+                  </button>
+                ))
+              ) : (
+                <>
+                  {(!activeBook?.bookmarks || activeBook.bookmarks.length === 0) && (
+                    <div className="py-20 text-center opacity-20 uppercase font-black tracking-widest text-[10px]">No Bookmarks</div>
+                  )}
+                  {activeBook?.bookmarks?.sort((a,b) => b.timestamp - a.timestamp).map((bm) => (
+                    <div key={bm.id} className="relative group">
+                      <button onClick={() => { jumpTo(bm.index); setIsSidebarOpen(false); }} className="w-full text-left p-6 pr-12 rounded-[2.5rem] bg-zinc-500/5 hover:bg-zinc-500/10 transition-all">
+                        <p className="text-[10px] font-black opacity-30 uppercase tracking-widest mb-2">{new Date(bm.timestamp).toLocaleDateString()}</p>
+                        <p className="text-[11px] font-bold italic line-clamp-2 opacity-80 leading-relaxed">"{bm.label}"</p>
+                      </button>
+                      <button 
+                        onClick={() => deleteBookmark(bm.id)} 
+                        className="absolute right-4 top-1/2 -translate-y-1/2 p-2 opacity-0 group-hover:opacity-40 hover:!opacity-100 text-red-500 transition-all"
+                      >
+                        <Trash size={16} />
+                      </button>
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
           </div>
         </div>
