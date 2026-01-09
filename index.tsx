@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from '
 import { createRoot } from 'react-dom/client';
 import { 
   Play, Pause, SkipForward, SkipBack, Settings, X, 
-  List, Loader2, BookOpen, Trash2, Plus, FileText, Headphones, Bookmark, ChevronRight, Volume2, Globe, Zap, Trash
+  List, Loader2, BookOpen, Trash2, Plus, FileText, Headphones, Bookmark, ChevronRight, Volume2, Globe, Zap, Trash, Check
 } from 'lucide-react';
 import e from 'epubjs';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -331,20 +331,21 @@ const App = () => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [fontSize, setFontSize] = useState(20);
+  const [fontSize, setFontSize] = useState(() => parseInt(localStorage.getItem('reader_font_size') || '20'));
   const [pdfScale, setPdfScale] = useState(1.0);
   const [currentPage, setCurrentPage] = useState(1);
-  const [theme, setTheme] = useState<'light' | 'dark' | 'sepia'>('light');
-  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [theme, setTheme] = useState<'light' | 'dark' | 'sepia'>(() => (localStorage.getItem('reader_theme') as any) || 'light');
+  const [playbackSpeed, setPlaybackSpeed] = useState(() => parseFloat(localStorage.getItem('reader_speed') || '1.0'));
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>("");
-  const [ttsProvider, setTtsProvider] = useState<TtsProvider>('system');
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>(() => localStorage.getItem('reader_voice') || "");
+  const [ttsProvider, setTtsProvider] = useState<TtsProvider>(() => (localStorage.getItem('reader_provider') as any) || 'system');
   const [sidebarTab, setSidebarTab] = useState<'chapters' | 'bookmarks'>('chapters');
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeWordRef = useRef<HTMLSpanElement | null>(null);
   const pdfInstanceRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const isPlayingRef = useRef(false);
+  const wasPlayingBeforeInterruption = useRef(false);
   const wordIdxRef = useRef(0);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -353,6 +354,13 @@ const App = () => {
   const heartbeatRef = useRef<HTMLAudioElement | null>(null);
   const lastSavedIndexRef = useRef(0);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
+  // Settings Persistence
+  useEffect(() => localStorage.setItem('reader_font_size', fontSize.toString()), [fontSize]);
+  useEffect(() => localStorage.setItem('reader_theme', theme), [theme]);
+  useEffect(() => localStorage.setItem('reader_speed', playbackSpeed.toString()), [playbackSpeed]);
+  useEffect(() => localStorage.setItem('reader_provider', ttsProvider), [ttsProvider]);
+  useEffect(() => { if (selectedVoiceURI) localStorage.setItem('reader_voice', selectedVoiceURI); }, [selectedVoiceURI]);
 
   // Screen Wake Lock Logic
   const requestWakeLock = useCallback(async () => {
@@ -375,17 +383,6 @@ const App = () => {
       wakeLockRef.current = null;
     }
   }, []);
-
-  // Re-acquire wake lock if tab becomes visible and music is playing
-  useEffect(() => {
-    const handleVisibilityChange = async () => {
-      if (wakeLockRef.current !== null && document.visibilityState === 'visible' && isPlayingRef.current) {
-        await requestWakeLock();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [requestWakeLock]);
 
   // Background audio anchor (Heartbeat)
   useEffect(() => {
@@ -411,8 +408,10 @@ const App = () => {
           return a.name.localeCompare(b.name);
         });
         setAvailableVoices(sorted);
+        
+        // If no voice is selected yet, or selected voice no longer exists, choose a high quality default
         if (!selectedVoiceURI) {
-          const pref = sorted.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Premium'))) || sorted[0];
+          const pref = sorted.find(v => v.default) || sorted.find(v => v.lang.startsWith('en') && (v.name.includes('Natural') || v.name.includes('Premium'))) || sorted[0];
           if (pref) setSelectedVoiceURI(pref.voiceURI);
         }
       }
@@ -548,7 +547,7 @@ const App = () => {
 
     window.speechSynthesis.cancel();
     const utt = new SpeechSynthesisUtterance(text);
-    const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices[0];
+    const v = availableVoices.find(x => x.voiceURI === selectedVoiceURI) || availableVoices.find(v => v.default) || availableVoices[0];
     if (v) utt.voice = v;
     utt.rate = playbackSpeed;
     utt.onboundary = (e) => {
@@ -574,19 +573,6 @@ const App = () => {
     window.speechSynthesis.speak(utt);
   }, [activeBook, availableVoices, selectedVoiceURI, playbackSpeed, totalWordsCount, ttsProvider, speakNeuralGemini, saveProgressThrottled, updateMediaSessionPosition, requestWakeLock, releaseWakeLock, saveProgressImmediate]);
 
-  const jumpTo = useCallback((idx: number) => {
-    initAudioContext();
-    speechSessionIdRef.current++;
-    window.speechSynthesis.cancel();
-    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
-    const safeIdx = Math.max(0, Math.min(idx, totalWordsCount - 1));
-    wordIdxRef.current = safeIdx;
-    setCurrentWordIndex(safeIdx);
-    updateMediaSessionPosition();
-    if (activeBook) updateBookProgress(activeBook.id, safeIdx);
-    if (isPlayingRef.current) setTimeout(speak, 50);
-  }, [totalWordsCount, speak, activeBook, initAudioContext, updateMediaSessionPosition]);
-
   const togglePlayback = useCallback(() => {
     initAudioContext();
     if (isPlayingRef.current) {
@@ -607,6 +593,42 @@ const App = () => {
       speak();
     }
   }, [speak, initAudioContext, saveProgressImmediate, requestWakeLock, releaseWakeLock]);
+
+  const jumpTo = useCallback((idx: number) => {
+    initAudioContext();
+    speechSessionIdRef.current++;
+    window.speechSynthesis.cancel();
+    if (audioSourceRef.current) try { audioSourceRef.current.stop(); } catch(e){}
+    const safeIdx = Math.max(0, Math.min(idx, totalWordsCount - 1));
+    wordIdxRef.current = safeIdx;
+    setCurrentWordIndex(safeIdx);
+    updateMediaSessionPosition();
+    if (activeBook) updateBookProgress(activeBook.id, safeIdx);
+    if (isPlayingRef.current) setTimeout(speak, 50);
+  }, [totalWordsCount, speak, activeBook, initAudioContext, updateMediaSessionPosition]);
+
+  // System Interruption Handler (Phone Calls / Interrupted Backgrounding)
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden') {
+        if (isPlayingRef.current) {
+          wasPlayingBeforeInterruption.current = true;
+          togglePlayback();
+          wasPlayingBeforeInterruption.current = true;
+        }
+      } else if (document.visibilityState === 'visible') {
+        if (wakeLockRef.current !== null && isPlayingRef.current) {
+          await requestWakeLock();
+        }
+        if (wasPlayingBeforeInterruption.current) {
+          wasPlayingBeforeInterruption.current = false;
+          togglePlayback();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [requestWakeLock, togglePlayback]);
 
   const addBookmark = useCallback(() => {
     if (!activeBook) return;
@@ -648,11 +670,22 @@ const App = () => {
       });
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
       updateMediaSessionPosition();
+      
+      // Hardware Control Handlers
       navigator.mediaSession.setActionHandler('play', togglePlayback);
       navigator.mediaSession.setActionHandler('pause', togglePlayback);
       navigator.mediaSession.setActionHandler('seekto', (d) => { if (d.seekTime !== undefined) jumpTo(Math.floor(d.seekTime)); });
       navigator.mediaSession.setActionHandler('seekbackward', () => jumpTo(wordIdxRef.current - 500));
       navigator.mediaSession.setActionHandler('seekforward', () => jumpTo(wordIdxRef.current + 500));
+      
+      // Bluetooth Skipping
+      navigator.mediaSession.setActionHandler('previoustrack', () => jumpTo(wordIdxRef.current - 1000));
+      navigator.mediaSession.setActionHandler('nexttrack', () => jumpTo(wordIdxRef.current + 1000));
+      
+      // Stop Handler
+      navigator.mediaSession.setActionHandler('stop', () => {
+        if (isPlayingRef.current) togglePlayback();
+      });
     }
   }, [activeBook, isPlaying, currentChapter, updateMediaSessionPosition, togglePlayback, jumpTo]);
 
@@ -813,10 +846,8 @@ const App = () => {
               </div>
             )}
             
-            {/* SLEEK ON-SCREEN CONTROLS */}
             <div className="absolute bottom-10 left-0 right-0 px-6 z-50 pointer-events-none flex justify-center">
               <div className="w-full max-w-lg glass pointer-events-auto rounded-full border border-white/20 dark:border-white/5 shadow-[0_25px_60px_rgba(0,0,0,0.15)] overflow-hidden flex flex-col">
-                {/* Slim Integrated Progress Bar */}
                 <div className="w-full h-[3px] bg-zinc-500/10 flex">
                    <div 
                     className="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_8px_rgba(37,99,235,0.6)]" 
@@ -824,9 +855,7 @@ const App = () => {
                    />
                 </div>
 
-                {/* Elegant Controls Pill */}
                 <div className="px-3 py-2.5 flex items-center justify-between gap-1">
-                  {/* Left: Speed Indicator */}
                   <button 
                     onClick={() => setIsSettingsOpen(true)} 
                     className="h-10 px-4 rounded-full bg-zinc-500/5 flex items-center justify-center active:scale-95 transition-all group"
@@ -834,7 +863,6 @@ const App = () => {
                     <span className="text-[10px] font-black text-blue-600/60 group-hover:text-blue-600">{playbackSpeed}x</span>
                   </button>
 
-                  {/* Center: Playback Core */}
                   <div className="flex items-center gap-1.5">
                     <button 
                         onClick={() => jumpTo(wordIdxRef.current - 500)} 
@@ -858,7 +886,6 @@ const App = () => {
                     </button>
                   </div>
 
-                  {/* Right: Bookmark / Audio Status */}
                   <button 
                     onClick={addBookmark}
                     className="w-10 h-10 flex items-center justify-center rounded-full bg-zinc-500/5 text-blue-600 active:scale-95 transition-all"
@@ -952,19 +979,24 @@ const App = () => {
                 {ttsProvider === 'system' && (
                   <div className="space-y-6">
                     <div className="flex justify-between items-center">
-                        <span className="text-[11px] font-black opacity-30 uppercase tracking-widest block">Vocal Matrix</span>
-                        <span className="text-[10px] font-black text-blue-600 bg-blue-600/10 px-3 py-1 rounded-full uppercase">{availableVoices.length} Voices Found</span>
+                        <span className="text-[11px] font-black opacity-30 uppercase tracking-widest block">Vocal Matrix (App Default)</span>
+                        <span className="text-[10px] font-black text-blue-600 bg-blue-600/10 px-3 py-1 rounded-full uppercase">{availableVoices.length} Voices</span>
                     </div>
-                    <div className="relative">
+                    <div className="relative group">
                         <select 
                           value={selectedVoiceURI} 
                           onChange={e => { setSelectedVoiceURI(e.target.value); initAudioContext(); }} 
-                          className="w-full p-6 rounded-[2.5rem] bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none font-bold appearance-none dark:text-white transition-all truncate"
+                          className="w-full p-6 pr-12 rounded-[2.5rem] bg-zinc-500/5 border-2 border-transparent focus:border-blue-600 outline-none font-bold appearance-none dark:text-white transition-all truncate shadow-inner"
                         >
-                          {availableVoices.length === 0 ? <option>Initializing...</option> : availableVoices.map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name.replace(/(Microsoft |Google |Natural |Online |Premium )/g, '')} ({v.lang})</option>)}
+                          {availableVoices.length === 0 ? <option>Initializing Matrix...</option> : availableVoices.map(v => (
+                            <option key={v.voiceURI} value={v.voiceURI}>
+                              {v.default ? '★ ' : ''}{v.name.replace(/(Microsoft |Google |Natural |Online |Premium )/g, '')} ({v.lang}) {v.default ? '(System Default)' : ''}
+                            </option>
+                          ))}
                         </select>
                         <ChevronRight className="absolute right-6 top-1/2 -translate-y-1/2 rotate-90 opacity-40 pointer-events-none" />
                     </div>
+                    <p className="text-[10px] font-bold opacity-30 text-center uppercase tracking-widest">Selected voice is now the default for all books on this device.</p>
                   </div>
                 )}
                 <div className="space-y-6">
